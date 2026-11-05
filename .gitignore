@@ -1,0 +1,15 @@
+# 개인정보가 담긴 파일은 절대 저장소에 올리지 않습니다
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.sql.gz
+*.dump
+backup*/
+data/
+uploads/
+.env
+.env.*
+*service_role*
+.DS_Store
+Thumbs.db
