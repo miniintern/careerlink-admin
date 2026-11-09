@@ -1301,6 +1301,10 @@ function normRow(raw, u){
 
 /* ---------- 파일 읽기 ---------- */
 const nonEmpty = r => Array.isArray(r) && r.some(v => v !== null && v !== undefined && String(v).trim() !== '');
+// 사람 정보(이름·휴대전화·이메일·생년월일)가 하나도 없는 행은 양식에 연번·사업명만 미리 채워 둔 빈 행으로 봅니다
+const PERSON_KEYS = ['name','phone','email','birth_date'];
+function personCols(hdr, mapping){ const cols = []; (hdr || []).forEach((h, i) => { const k = mapping ? mapping[i] : aliasFor(h); if(PERSON_KEYS.includes(k)) cols.push(i); }); return cols; }
+const hasPerson = (r, cols) => Array.isArray(r) && (cols.length ? cols.some(i => r[i] !== null && r[i] !== undefined && String(r[i]).trim() !== '') : nonEmpty(r));
 async function readWorkbook(file){
   if(!window.XLSX) throw Error('엑셀 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하고 새로고침해 주세요.');
   if(file.size > MAX_MB * 1024 * 1024) throw Error(`파일이 ${MAX_MB}MB보다 큽니다. 시트를 나눠서 올려 주세요.`);
@@ -1311,12 +1315,12 @@ async function readWorkbook(file){
   } else if(/\.xlsx?$/i.test(file.name)) wb = XLSX.read(buf, {type:'array', cellDates:true});
   else throw Error('.xlsx 또는 .csv 파일만 올릴 수 있습니다.');
   const sheets = {};
-  wb.SheetNames.forEach(n => { const ws = wb.Sheets[n]; if(!ws['!ref']) return; const off = XLSX.utils.decode_range(ws['!ref']).s.r; sheets[n] = {aoa: XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:true}), offset: off}; });
+  wb.SheetNames.forEach((n, idx) => { const ws = wb.Sheets[n]; if(!ws['!ref']) return; const off = XLSX.utils.decode_range(ws['!ref']).s.r; const hidden = !!(wb.Workbook && wb.Workbook.Sheets && wb.Workbook.Sheets[idx] && wb.Workbook.Sheets[idx].Hidden); sheets[n] = {aoa: XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:true}), offset: off, hidden}; });
   return sheets;
 }
 function aliasFor(h){ const k = hk(h); if(!k) return null; if(LOCKED_EXCLUDE.has(k)) return '__exclude__'; return st.up.learned[k] || DEFAULT_ALIASES[k] || null; }
 function detectHeader(aoa){ for(let i = 0; i < Math.min(15, aoa.length); i++){ if((aoa[i] || []).filter(c => aliasFor(c)).length >= 3) return i; } const f = aoa.findIndex(nonEmpty); return f < 0 ? 0 : f; }
-function sheetStats(name){ const s = st.up.sheets[name]; const h = detectHeader(s.aoa); return {h, data: s.aoa.slice(h + 1).filter(nonEmpty).length}; }
+function sheetStats(name){ const s = st.up.sheets[name]; const h = detectHeader(s.aoa); const pc = personCols(s.aoa[h]); return {h, data: s.aoa.slice(h + 1).filter(r => nonEmpty(r) && hasPerson(r, pc)).length, blank: s.aoa.slice(h + 1).filter(r => nonEmpty(r) && !hasPerson(r, pc)).length}; }
 function setSheet(name){ const u = st.up; u.sheet = name; u.headerRow = detectHeader(u.sheets[name].aoa); buildMapping(); }
 function buildMapping(){
   const u = st.up; const hdr = u.sheets[u.sheet].aoa[u.headerRow] || []; u.mapping = {}; u.manual = {};
@@ -1325,7 +1329,8 @@ function buildMapping(){
 async function startUpload(name, sheets){
   const u = up0(); u.learned = await store.aliases(); u.filename = name; u.sheets = sheets; st.up = u;
   const names = Object.keys(sheets); if(!names.length){ u.err = '읽을 수 있는 시트가 없습니다.'; return renderMain(); }
-  const best = names.map(n => ({n, ...sheetStats(n)})).sort((a, b) => b.data - a.data)[0];
+  // 숨긴 시트는 자동으로 고르지 않습니다(엑셀에서 보이지 않는 데이터가 실수로 올라가지 않도록)
+  const best = names.map(n => ({n, hidden: sheets[n].hidden, ...sheetStats(n)})).sort((a, b) => (a.hidden - b.hidden) || (b.data - a.data))[0];
   setSheet(best.n); u.step = 'map'; renderMain();
 }
 function mappingIssues(){
@@ -1343,9 +1348,10 @@ const CMP_FIELDS = [['birth_date','생년월일', v => birthToYY(v)],['email','�
 async function analyzeUpload(){
   const u = st.up; const {issues} = mappingIssues(); if(issues.length){ u.err = issues.join(' '); return renderMain(); }
   u.err = ''; u.busy = true; renderMain();
-  const {aoa, offset} = u.sheets[u.sheet]; const out = [];
+  const {aoa, offset} = u.sheets[u.sheet]; const out = []; const pcols = personCols(aoa[u.headerRow], u.mapping); let blankRows = 0;
   for(let i = u.headerRow + 1; i < aoa.length; i++){
     const r = aoa[i]; if(!nonEmpty(r)) continue;
+    if(!hasPerson(r, pcols)){ blankRows++; continue; }
     if(out.length >= MAX_ROWS){ u.err = `한 번에 ${fmtNum(MAX_ROWS)}행까지 올릴 수 있어 ${i + offset + 1}행부터는 제외했습니다. 나머지는 파일을 나눠 올려 주세요.`; break; }
     const raw = {}; Object.entries(u.mapping).forEach(([c, k]) => { if(!k.startsWith('__')) raw[k] = r[c] ?? null; });
     out.push({rowNo: i + offset + 1, idx: out.length, ...normRow(raw, u), decision:'new', match:null, dupOf:null, inFileOf:null});
@@ -1382,6 +1388,7 @@ async function analyzeUpload(){
   const hdr = u.sheets[u.sheet].aoa[u.headerRow] || []; const learn = {};
   Object.keys(u.manual).forEach(i => { const k = hk(hdr[i]); if(k && !LOCKED_EXCLUDE.has(k)) learn[k] = u.mapping[i]; });
   if(Object.keys(learn).length) await store.saveAliases(learn);
+  u.blankRows = blankRows;
   u.rows = out; u.step = 'preview'; u.filter = 'all'; u.page = 1; u.busy = false; renderMain(); window.scrollTo(0, 0);
 }
 const rowCat = r => r.errors.length ? 'error' : r.decision === 'skip' ? 'skip' : r.dupOf ? 'dup' : r.decision === 'link' ? 'link' : 'new';
@@ -1487,9 +1494,9 @@ function pickView(){
 }
 function mapView(){
   const u = st.up; const {aoa, offset} = u.sheets[u.sheet]; const hdr = aoa[u.headerRow] || []; const {issues} = mappingIssues();
-  const sheetOpts = Object.keys(u.sheets).map(n => { const s = sheetStats(n); return `<option value="${E(n)}" ${n === u.sheet ? 'selected' : ''}>${E(n)} · ${fmtNum(s.data)}행</option>`; }).join('');
+  const sheetOpts = Object.keys(u.sheets).map(n => { const s = sheetStats(n); return `<option value="${E(n)}" ${n === u.sheet ? 'selected' : ''}>${u.sheets[n].hidden ? '[숨긴 시트] ' : ''}${E(n)} · ${fmtNum(s.data)}행${s.blank ? ` (빈 행 ${fmtNum(s.blank)}개 제외)` : ''}</option>`; }).join('');
   const hdrOpts = aoa.slice(0, 15).map((r, i) => nonEmpty(r) ? `<option value="${i}" ${i === u.headerRow ? 'selected' : ''}>${i + offset + 1}행: ${E(r.filter(c => sv(c)).slice(0, 4).map(sv).join(', ').slice(0, 40))}</option>` : '').join('');
-  const dataRows = aoa.slice(u.headerRow + 1).filter(nonEmpty);
+  const pcols = personCols(hdr, u.mapping); const dataRows = aoa.slice(u.headerRow + 1).filter(r => nonEmpty(r) && hasPerson(r, pcols)); const blankN = aoa.slice(u.headerRow + 1).filter(r => nonEmpty(r) && !hasPerson(r, pcols)).length;
   const ex = i => dataRows.map(r => sv(r[i])).filter(Boolean).slice(0, 2).map(v => v.length > 18 ? v.slice(0, 18) + '…' : v).join(' · ');
   const opts = (sel, locked) => locked ? `<option value="__exclude__" selected>항상 제외(저장 금지)</option>` : UP_FIELDS.map(([k, l]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${l}</option>`).join('');
   const rows = hdr.map((h, i) => {
@@ -1501,10 +1508,11 @@ function mapView(){
   }).join('');
   const usedCount = Object.values(u.mapping).filter(k => !k.startsWith('__')).length;
   return `<div class="panel">
-    <div class="ph"><h2>${E(u.filename)}</h2><small>엑셀 열 ${Object.keys(u.mapping).length}개 중 ${usedCount}개 연결 · 데이터 ${fmtNum(dataRows.length)}행</small></div>
+    <div class="ph"><h2>${E(u.filename)}</h2><small>엑셀 열 ${Object.keys(u.mapping).length}개 중 ${usedCount}개 연결 · 데이터 ${fmtNum(dataRows.length)}행${blankN ? ` · 이름·연락처 없는 빈 행 ${fmtNum(blankN)}개 제외` : ''}</small></div>
     <div class="toolbar"><label class="f" for="up-sheet" style="flex:1 1 220px"><span style="font-size:12px;color:var(--sub)">시트</span><select class="select" id="up-sheet">${sheetOpts}</select></label>
       <label class="f" for="up-header" style="flex:1 1 320px"><span style="font-size:12px;color:var(--sub)">머리글(열 이름) 행</span><select class="select" id="up-header">${hdrOpts}</select></label></div>
   </div>
+  ${u.sheets[u.sheet].hidden ? `<div class="issues">이 시트(${E(u.sheet)})는 엑셀에서 <b>숨겨진 시트</b>입니다. 엑셀 화면에서는 보이지 않지만 데이터가 들어 있습니다. 올리려던 시트가 맞는지 꼭 확인하세요.</div>` : ''}
   <div class="panel"><div class="ph"><h2>열 매칭</h2><small>엑셀 열을 DB 항목에 연결하세요. 직접 바꾼 매칭은 다음 업로드에서도 기억합니다.</small></div>
     <div class="tw" style="max-height:none"><table class="grid maptable"><thead><tr><th>엑셀 열</th><th>예시 값</th><th>DB 항목</th><th>상태</th></tr></thead><tbody>${rows}</tbody></table></div>
   </div>
@@ -1535,7 +1543,7 @@ function previewView(){
   const tabs = [['all','전체'],['new','신규 등록'],['link','기존에 연결'],['dup','중복 의심'],['warn','경고 있음'],['error','오류'],['skip','건너뜀']];
   return `${u.err ? `<div class="issues">${E(u.err)}</div>` : ''}
   <div class="panel">
-    <div class="ph"><h2>${E(u.filename)} · ${E(u.sheet)}</h2><small>아직 DB에 반영되지 않았습니다</small></div>
+    <div class="ph"><h2>${E(u.filename)} · ${E(u.sheet)}</h2><small>아직 DB에 반영되지 않았습니다${u.blankRows ? ` · 이름·연락처가 없는 빈 행 ${fmtNum(u.blankRows)}개는 제외` : ''}</small></div>
     <div class="segs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" class="seg ${u.filter === k ? 'on' : ''}" data-upf="${k}" aria-selected="${u.filter === k}">${l} <b>${fmtNum(c[k])}</b></button>`).join('')}</div>
     ${c.error ? `<div class="issues" style="margin-top:12px">오류 ${fmtNum(c.error)}행은 반영되지 않습니다. 엑셀에서 고친 뒤 그 행만 다시 올리면 됩니다. '검사 결과 내려받기'로 오류 목록을 받을 수 있습니다.</div>` : ''}
     <div class="tablebar"><span class="count"><b>${fmtNum(list.length)}</b>행</span><button class="btn ghost sm" type="button" data-up="export-check">검사 결과 내려받기</button></div>
