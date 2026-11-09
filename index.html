@@ -747,7 +747,7 @@ function makeSupabaseStore(cfg){
   }
   async function afterLogin(){
     const m = await rpc('me');
-    if(!m){ await sb.auth.signOut(); throw Error('승인된 관리자 계정이 아닙니다. 최고관리자에게 관리자 등록을 요청하세요.'); }
+    if(!m){ await sb.auth.signOut({scope:'local'}); throw Error('승인된 관리자 계정이 아닙니다. 최고관리자에게 관리자 등록을 요청하세요.'); }
     me = m; await refreshCaches(); return me;
   }
   return {
@@ -758,7 +758,7 @@ function makeSupabaseStore(cfg){
       if(error) throw Error(/invalid/i.test(error.message) ? '아이디 또는 비밀번호가 맞지 않습니다.' : /rate|many/i.test(error.message) ? '로그인 시도가 너무 많습니다. 잠시 뒤 다시 시도해 주세요.' : friendly(error.message));
       const m = await afterLogin(); await audit('login'); return m;
     },
-    async logout(reason){ await audit('logout', null, reason ? {reason} : null); await sb.auth.signOut(); me = null; },
+    async logout(reason){ await audit('logout', null, reason ? {reason} : null); await sb.auth.signOut({scope:'local'}); me = null; },
     async changePassword(cur, next){
       if(next.length < 10 || !/[A-Za-z]/.test(next) || !/\d/.test(next)) throw Error('새 비밀번호는 10자 이상, 영문과 숫자를 함께 써 주세요.');
       const {error: e1} = await sb.auth.signInWithPassword({email:me.email, password:cur}); if(e1) throw Error('현재 비밀번호가 맞지 않습니다.');
