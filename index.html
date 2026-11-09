@@ -1744,6 +1744,10 @@ function closeDetail(force){
   st.detail = null; st.draft = null; refreshDrawer(); markSel();
 }
 async function save(){
+  if(st.saving) return; st.saving = true; document.querySelectorAll('[data-act="save"]').forEach(b => { b.disabled = true; b.textContent = '저장 중…'; });
+  try{ await saveInner(); }catch(e){ toast(e.message); refreshDrawer(); } finally{ st.saving = false; }
+}
+async function saveInner(){
   const d = st.draft; st.errs = validate(d);
   if(Object.keys(st.errs).length){ refreshDrawer(); toast('입력값을 확인해 주세요.'); return; }
   const patch = {}; const map = {birth:'birth_date'};
@@ -1842,8 +1846,8 @@ document.addEventListener('input', ev => {
   }
   if(t.dataset.reason !== undefined) st.reason = t.value;
 });
-document.addEventListener('submit', async ev => {
-  ev.preventDefault(); const f = ev.target; const fd = new FormData(f);
+async function handleSubmit(f){
+  const fd = new FormData(f);
   if(f.id === 'loginForm'){
     st.loginEmail = String(fd.get('email') || '');
     st.busy = true; st.loginErr = ''; render();
@@ -1866,6 +1870,17 @@ document.addEventListener('submit', async ev => {
     try{ await store.changePassword(fd.get('cur'), fd.get('next')); closeModal(); toast(DEMO ? '비밀번호를 바꿨습니다. (체험판에서는 실제로 바뀌지 않습니다)' : '비밀번호를 바꿨습니다. 다음 로그인부터 새 비밀번호를 쓰세요.'); renderMain(); }
     catch(e){ err.innerHTML = `<span class="err">${E(e.message)}</span>`; }
   }
+}
+// 저장 중에 버튼을 다시 누르거나 Enter를 눌러도 한 번만 처리되도록 막습니다
+document.addEventListener('submit', async ev => {
+  ev.preventDefault(); const f = ev.target;
+  if(f.dataset.busy) return;
+  f.dataset.busy = '1';
+  const btns = [...f.querySelectorAll('button[type=submit]')];
+  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(f.id !== 'filters' && f.id !== 'loginForm') b.textContent = '처리 중…'; });
+  try{ await handleSubmit(f); }
+  catch(e){ toast(e.message); }
+  finally{ delete f.dataset.busy; if(f.isConnected) btns.forEach(b => { b.disabled = false; b.textContent = b.dataset.label; }); }
 });
 document.addEventListener('keydown', ev => {
   if(ev.key === 'Escape'){ if($('#modal').innerHTML) return closeModal(); if(st.detail) return closeDetail(); }
