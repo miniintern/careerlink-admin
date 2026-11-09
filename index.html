@@ -316,7 +316,7 @@ table.prev select{padding:4px 6px;font-size:12px}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.js"></script>
-<script src="config.js"></script>
+<script>document.write('<script src="config.js?v=' + Date.now() + '"><\/script>');</script>
 <script>
 /* =====================================================================
    오픈놀 커리어링크 관리자 페이지 · STEP 2 (가상 데이터 체험판)
@@ -959,10 +959,10 @@ async function dashboardView(){
   return `<div class="head"><div><h1>통합 대시보드</h1><p>${new Date().toLocaleDateString('ko-KR',{year:'numeric',month:'long',day:'numeric',weekday:'short'})} 기준 · 통합·삭제된 참여자는 제외</p></div>
     <button class="btn ghost" type="button" data-go-people="all">참여자 목록 보기</button></div>
   <section class="kpis">
-    <button class="kpi" type="button" data-go-people="all"><span class="lbl">등록 참여자 (중복 제외)</span><strong>${fmtNum(s.unique)}명</strong><span class="sub">사업 참여 ${fmtNum(s.enrollments)}건 · 1인 평균 ${(s.enrollments/s.unique).toFixed(2)}건</span></button>
+    <button class="kpi" type="button" data-go-people="all"><span class="lbl">등록 참여자 (중복 제외)</span><strong>${fmtNum(s.unique)}명</strong><span class="sub">사업 참여 ${fmtNum(s.enrollments)}건 · 1인 평균 ${s.unique ? (s.enrollments/s.unique).toFixed(2) : 0}건</span></button>
     <button class="kpi" type="button" data-go-emp="employed"><span class="lbl">재직·창업</span><strong>${fmtNum(workers)}명</strong><span class="sub">재직 ${fmtNum(s.by.employed)} · 창업 ${fmtNum(s.by.startup)} · 상태 확인자 중 ${rate}%</span></button>
     <button class="kpi" type="button" data-go-emp="seeking"><span class="lbl">구직 중</span><strong>${fmtNum(s.by.seeking)}명</strong><span class="sub">진학·교육 ${fmtNum(s.by.education)} · 기타 ${fmtNum(s.by.other)}</span></button>
-    <button class="kpi attn" type="button" data-go-emp="unknown"><span class="lbl">미확인 · 확인 필요</span><strong>${fmtNum(s.by.unknown)}명</strong><span class="sub">전체의 ${Math.round(s.by.unknown/s.unique*100)}% · 중복 의심 ${s.dups}쌍</span></button>
+    <button class="kpi attn" type="button" data-go-emp="unknown"><span class="lbl">미확인 · 확인 필요</span><strong>${fmtNum(s.by.unknown)}명</strong><span class="sub">전체의 ${s.unique ? Math.round(s.by.unknown/s.unique*100) : 0}% · 중복 의심 ${s.dups}쌍</span></button>
   </section>
   <section class="grid2">
     <div class="panel"><div class="ph"><h2>사업 연도별 참여 현황</h2><small>같은 해 여러 사업에 참여하면 인원은 1명, 건수는 여러 건</small></div>${yearChart(s.years)}</div>
@@ -978,6 +978,7 @@ async function dashboardView(){
   </section>`;
 }
 function yearChart(ys){
+  if(!ys || !ys.length || !ys.some(y => y.enrollments)) return `<div class="empty">아직 등록된 사업 참여 이력이 없습니다. 엑셀 업로드나 참여자 등록을 하면 연도별 현황이 나타납니다.</div>`;
   const W = 560, H = 230, L = 44, B = 32, T = 16; const max = Math.max(...ys.map(y => y.enrollments)) * 1.12;
   const step = Math.pow(10, Math.floor(Math.log10(max))) ; const tickStep = max/step > 5 ? step : step/2; const ticks = []; for(let v = 0; v <= max; v += tickStep) ticks.push(v);
   const Y = v => T + (H - T - B) * (1 - v / max); const gw = (W - L - 12) / ys.length; const bw = Math.min(42, gw/3.2);
@@ -992,8 +993,8 @@ function yearChart(ys){
   </svg></div><div class="legend"><span><i style="background:var(--accent)"></i>중복 제외 인원</span><span><i style="background:var(--accent-soft);border:1px solid var(--accent)"></i>사업 참여 건수</span></div>`;
 }
 function statusStack(by, total){
-  return `<div class="bars"><div class="stack" role="img" aria-label="현재상태 분포">${STATUS_ORDER.map(s => `<span title="${STATUS[s]} ${by[s]}명" style="width:${by[s]/total*100}%;background:${STATUS_COLOR[s]}"></span>`).join('')}</div></div>
-  <div class="slist">${STATUS_ORDER.map(s => `<button type="button" data-go-emp="${s}"><span><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${STATUS_COLOR[s]};margin-right:6px"></i>${STATUS[s]}</span><b>${fmtNum(by[s])}<span class="dim" style="font-weight:400"> · ${Math.round(by[s]/total*100)}%</span></b></button>`).join('')}</div>
+  return `<div class="bars"><div class="stack" role="img" aria-label="현재상태 분포">${STATUS_ORDER.map(s => `<span title="${STATUS[s]} ${by[s]}명" style="width:${total ? by[s]/total*100 : 0}%;background:${STATUS_COLOR[s]}"></span>`).join('')}</div></div>
+  <div class="slist">${STATUS_ORDER.map(s => `<button type="button" data-go-emp="${s}"><span><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${STATUS_COLOR[s]};margin-right:6px"></i>${STATUS[s]}</span><b>${fmtNum(by[s])}<span class="dim" style="font-weight:400"> · ${total ? Math.round(by[s]/total*100) : 0}%</span></b></button>`).join('')}</div>
   <p style="margin:14px 0 0;font-size:12px;color:var(--sub);line-height:1.6">미확인은 엑셀에 상태 값이 없던 참여자입니다. 취업 현황 관리에서 확인 후 상태를 바꾸면 변경 전·후가 이력에 남습니다.</p>`;
 }
 
