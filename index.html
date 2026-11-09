@@ -808,7 +808,7 @@ function makeSupabaseStore(cfg){
     async listUploads(){ return rpc('upload_list'); },
     async uploadRows(id){
       const out = []; for(let from = 0; ; from += 1000){ const r = await q(sb.from('upload_rows').select('*').eq('upload_id', id).order('idx').range(from, from + 999)); out.push(...r); if(r.length < 1000) break; }
-      return out.map(r => ({idx:r.idx, rowNo:r.row_no, n:r.normalized || {program:{}}, errors:r.errors || [], warnings:r.warnings || [], info:r.info || [], decision:r.decision, dupOf:r.dup_of, match:r.match_participant_id ? {pid:r.match_participant_id} : null, inFileOf:r.in_file_of, result:r.result, code:r.participant_code}));
+      return out.map(r => ({idx:r.idx, rowNo:r.row_no, n:r.normalized || {program:{}}, errors:r.errors || [], warnings:r.warnings || [], info:r.info || [], decision:r.decision, dupOf:r.dup_of, match:r.match_participant_id ? {pid:r.match_participant_id} : null, inFileOf:r.in_file_of, linkKind: r.in_file_of != null ? 'infile' : r.match_participant_id ? 'existing' : null, result:r.result, code:r.participant_code}));
     },
     async revertUpload(id){ await rpc('upload_revert', {upload_id:id}); await refreshCaches(); return true; },
     /* 중복 · 통합 */
@@ -1374,16 +1374,22 @@ async function analyzeUpload(){
     if(!m && !r.dupOf && byName.get(n.name)) r.info.push(`같은 이름의 참여자 ${byName.get(n.name).length}명이 있습니다(참고)`);
     if(m){
       r.match = {pid:m.p.id, code:m.p.code, name:m.p.name, why:m.why}; r.decision = 'link';
-      if(m.p.programKeys.includes(pk)) r.info.push('이미 같은 사업 참여 이력이 있어 빈 칸만 보완합니다');
+      if(m.p.programKeys.includes(pk)){ r.linkKind = 'already'; r.info.push('이미 같은 사업 참여 이력이 있어 새로 추가하지 않고 빈 칸만 보완합니다'); }
+      else { r.linkKind = 'existing'; const k = m.p.programKeys.length; r.info.push(`이미 등록된 참여자입니다. 이 사업을 추가해 참여 사업이 ${k}개 → ${k + 1}개가 됩니다`); }
       CMP_FIELDS.forEach(([k, label, f = x => x]) => { const fv = n[k], ev = m.p[k]; if(fv != null && fv !== '' && ev != null && ev !== '' && String(fv) !== String(ev)) r.warnings.push(`${label} 다름(기존 ${f(ev)} / 파일 ${f(fv)}) · ${u.overwrite ? '파일 값으로 바꿉니다' : '기존 값 유지'}`); });
       if(n.current_status !== 'unknown' && m.p.current_status !== 'unknown' && n.current_status !== m.p.current_status) r.warnings.push(`현재상태 다름(기존 ${STATUS[m.p.current_status]} / 파일 ${STATUS[n.current_status]}) · ${u.overwrite ? '파일 값으로 바꿉니다' : '기존 값 유지'}`);
     } else if(!r.errors.length){
       const prev = (pd && seenPhone.has(pd)) ? seenPhone.get(pd) : (n.email && seenEmail.has(n.email)) ? seenEmail.get(n.email) : null;
-      if(prev != null && out[prev].n.name === n.name){ r.inFileOf = prev; r.decision = 'link'; r.info.push(`같은 파일 ${out[prev].rowNo}행과 같은 사람으로 보고 참여 이력만 추가합니다`); }
+      if(prev != null && out[prev].n.name === n.name){
+        const root = out[prev].inFileOf ?? prev; r.inFileOf = root; r.decision = 'link'; r.linkKind = 'infile';
+        out[root].sameRows = (out[root].sameRows || []).concat(r.idx); const k = out[root].sameRows.length + 1;
+        r.info.push(`같은 파일 ${out[root].rowNo}행(${out[root].n.program.name})과 같은 사람입니다. 한 사람으로 등록하고 이 사업을 추가해 참여 사업 ${k}개로 관리합니다`);
+      }
     }
     if(r.errors.length) r.decision = 'skip';
     if(!r.errors.length){ if(pd && !seenPhone.has(pd)) seenPhone.set(pd, r.idx); if(n.email && !seenEmail.has(n.email)) seenEmail.set(n.email, r.idx); }
   }
+  out.forEach(r => { if(r.sameRows && r.sameRows.length) r.info.push(`같은 파일 ${r.sameRows.map(i => out[i].rowNo).join('·')}행에도 같은 사람이 있어 참여 사업 ${r.sameRows.length + 1}개로 묶어 관리합니다`); });
   // 직접 바꾼 열 매칭은 다음 업로드에서도 쓰도록 저장
   const hdr = u.sheets[u.sheet].aoa[u.headerRow] || []; const learn = {};
   Object.keys(u.manual).forEach(i => { const k = hk(hdr[i]); if(k && !LOCKED_EXCLUDE.has(k)) learn[k] = u.mapping[i]; });
@@ -1392,7 +1398,16 @@ async function analyzeUpload(){
   u.rows = out; u.step = 'preview'; u.filter = 'all'; u.page = 1; u.busy = false; renderMain(); window.scrollTo(0, 0);
 }
 const rowCat = r => r.errors.length ? 'error' : r.decision === 'skip' ? 'skip' : r.dupOf ? 'dup' : r.decision === 'link' ? 'link' : 'new';
-const CAT = {new:['신규 등록','b-new'], link:['기존에 연결','b-link'], dup:['중복 의심','b-dup'], error:['오류','b-error'], skip:['건너뜀','b-skip']};
+const CAT = {new:['신규 등록','b-new'], link:['추가 참여','b-link'], dup:['중복 의심','b-dup'], error:['오류','b-error'], skip:['건너뜀','b-skip']};
+// 판정 표시: 같은 사람이 여러 사업에 참여한 경우를 구분해서 보여 줌
+function catLabel(r){
+  const c = rowCat(r);
+  if(c === 'new' && r.sameRows && r.sameRows.length) return `신규 등록 · 사업 ${r.sameRows.length + 1}개`;
+  if(c !== 'link') return CAT[c][0];
+  if(r.linkKind === 'already') return '이미 등록됨';
+  if(r.linkKind === 'infile') return '추가 참여 · 동일인';
+  return '추가 참여 · 기존 참여자';
+}
 function upCounts(rows){ const c = {all:rows.length, new:0, link:0, dup:0, warn:0, error:0, skip:0}; rows.forEach(r => { c[rowCat(r)]++; if(r.warnings.length && !r.errors.length) c.warn++; }); return c; }
 
 /* ---------- 확정 (40행씩 나눠 저장) ---------- */
@@ -1413,7 +1428,7 @@ async function commitUpload(){
 }
 function exportUploadRows(rows, name){
   if(!window.XLSX){ toast('엑셀 라이브러리를 불러오지 못했습니다.'); return; }
-  const data = rows.map(r => ({'엑셀 행':r.rowNo, '판정':CAT[rowCat(r)][0], '처리 결과':r.result || '', '관리번호':r.code || r.match?.code || '', '이름':r.n.name, '사업 연도':r.n.program.year || '', '사업명':r.n.program.name || '', '오류':r.errors.join(' / '), '경고':r.warnings.join(' / '), '참고':r.info.join(' / ')}));
+  const data = rows.map(r => ({'엑셀 행':r.rowNo, '판정':catLabel(r), '처리 결과':r.result || '', '관리번호':r.code || r.match?.code || '', '이름':r.n.name, '사업 연도':r.n.program.year || '', '사업명':r.n.program.name || '', '오류':r.errors.join(' / '), '경고':r.warnings.join(' / '), '참고':r.info.join(' / ')}));
   const ws = XLSX.utils.json_to_sheet(data); ws['!cols'] = [{wch:7},{wch:10},{wch:14},{wch:12},{wch:10},{wch:8},{wch:28},{wch:50},{wch:60},{wch:40}];
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '업로드 결과');
   const fn = `커리어링크_${name}_${todayISO().replace(/-/g,'')}.xlsx`;
@@ -1532,7 +1547,7 @@ function mapView(){
 }
 function msgs(r){
   const l = [...r.errors.map(m => `<span class="e">● ${E(m)}</span>`), ...r.warnings.map(m => `<span class="w">▲ ${E(m)}</span>`), ...r.info.map(m => `<span class="i">· ${E(m)}</span>`)];
-  if(r.match) l.unshift(`<span class="i">· ${E(r.match.why)} → ${E(r.match.name)} ${E(r.match.code)}</span>`);
+  if(r.match) l.unshift(`<span class="i">· ${E(r.match.why)}: ${E(r.match.name)} ${E(r.match.code)}</span>`);
   return l.length ? `<div class="msgs">${l.join('')}</div>` : '<span class="dim">문제 없음</span>';
 }
 function previewView(){
@@ -1540,7 +1555,7 @@ function previewView(){
   const list = u.rows.filter(r => u.filter === 'all' || (u.filter === 'warn' ? r.warnings.length && !r.errors.length : rowCat(r) === u.filter));
   const size = 50; const pageRows = list.slice((u.page - 1) * size, u.page * size);
   const applyN = u.rows.filter(r => !r.errors.length && r.decision !== 'skip').length;
-  const tabs = [['all','전체'],['new','신규 등록'],['link','기존에 연결'],['dup','중복 의심'],['warn','경고 있음'],['error','오류'],['skip','건너뜀']];
+  const tabs = [['all','전체'],['new','신규 등록'],['link','추가 참여(같은 사람)'],['dup','중복 의심'],['warn','경고 있음'],['error','오류'],['skip','건너뜀']];
   return `${u.err ? `<div class="issues">${E(u.err)}</div>` : ''}
   <div class="panel">
     <div class="ph"><h2>${E(u.filename)} · ${E(u.sheet)}</h2><small>아직 DB에 반영되지 않았습니다${u.blankRows ? ` · 이름·연락처가 없는 빈 행 ${fmtNum(u.blankRows)}개는 제외` : ''}</small></div>
@@ -1549,8 +1564,8 @@ function previewView(){
     <div class="tablebar"><span class="count"><b>${fmtNum(list.length)}</b>행</span><button class="btn ghost sm" type="button" data-up="export-check">검사 결과 내려받기</button></div>
     ${pageRows.length ? `<div class="tw"><table class="grid prev"><thead><tr><th>엑셀 행</th><th>판정</th><th>처리</th><th>이름</th><th>사업</th><th>휴대전화</th><th>생년월일</th><th>현재상태</th><th>확인할 내용</th></tr></thead><tbody>
     ${pageRows.map(r => { const cat = rowCat(r); const canLink = r.match || r.inFileOf != null;
-      return `<tr class="${r.errors.length ? 'err' : ''}"><td class="num">${r.rowNo}</td><td><span class="badge ${CAT[cat][1]}">${CAT[cat][0]}</span></td>
-      <td>${r.errors.length ? '<span class="dim">제외</span>' : `<select class="select" data-dec="${r.idx}" aria-label="${r.rowNo}행 처리"><option value="new" ${r.decision === 'new' ? 'selected' : ''}>신규 등록</option>${canLink ? `<option value="link" ${r.decision === 'link' ? 'selected' : ''}>기존에 연결</option>` : ''}<option value="skip" ${r.decision === 'skip' ? 'selected' : ''}>건너뛰기</option></select>`}</td>
+      return `<tr class="${r.errors.length ? 'err' : ''}"><td class="num">${r.rowNo}</td><td><span class="badge ${r.linkKind === 'already' && cat === 'link' ? 'b-skip' : CAT[cat][1]}">${catLabel(r)}</span></td>
+      <td>${r.errors.length ? '<span class="dim">제외</span>' : `<select class="select" data-dec="${r.idx}" aria-label="${r.rowNo}행 처리"><option value="new" ${r.decision === 'new' ? 'selected' : ''}>신규 등록</option>${canLink ? `<option value="link" ${r.decision === 'link' ? 'selected' : ''}>같은 사람으로 연결</option>` : ''}<option value="skip" ${r.decision === 'skip' ? 'selected' : ''}>건너뛰기</option></select>`}</td>
       <td class="name">${E(r.n.name) || '<span class="dim">(없음)</span>'}</td><td>${E(r.n.program.name || '')} <span class="dim">${r.n.program.year || ''}</span></td>
       <td class="num">${E(maskPhone(r.n.phone))}</td><td class="num">${r.n.birth_date ? birthToYY(r.n.birth_date) : r.n.birth_year ? `${r.n.birth_year}년` : ''}</td><td>${chip(r.n.current_status)}</td><td class="wrap">${msgs(r)}</td></tr>`; }).join('')}
     </tbody></table></div>${pager(list.length, u.page, size, 'data-uppage', '행')}` : '<div class="empty">이 조건에 해당하는 행이 없습니다.</div>'}
@@ -1562,7 +1577,7 @@ function doneView(){
   const u = st.up; const s = u.summary;
   if(!s) return `<div class="issues">${E(u.err || '반영 중 문제가 생겼습니다.')}</div>`;
   return `<div class="panel"><div class="ph"><h2>반영을 마쳤습니다 · 업로드 #${u.uploadId}</h2><small>${E(u.filename)} · ${E(u.sheet)}</small></div>
-    <div class="result"><div><b>${fmtNum(s.created)}</b><span>신규 등록</span></div><div><b>${fmtNum(s.linked)}</b><span>기존 참여자에 연결</span></div><div><b>${fmtNum(s.dups)}</b><span>중복 의심 추가</span></div><div><b>${fmtNum(s.errors)}</b><span>오류로 제외</span></div><div><b>${fmtNum(s.skipped)}</b><span>건너뜀</span></div></div>
+    <div class="result"><div><b>${fmtNum(s.created)}</b><span>신규 등록</span></div><div><b>${fmtNum(s.linked)}</b><span>추가 참여(같은 사람에 사업 추가)</span></div><div><b>${fmtNum(s.dups)}</b><span>중복 의심 추가</span></div><div><b>${fmtNum(s.errors)}</b><span>오류로 제외</span></div><div><b>${fmtNum(s.skipped)}</b><span>건너뜀</span></div></div>
     <p style="margin:14px 0 0;font-size:12.5px;color:var(--sub)">${s.programs ? `새 사업 ${s.programs}개가 등록되었습니다. ` : ''}잘못 올렸다면 아래 업로드 기록에서 이 업로드를 통째로 되돌릴 수 있습니다.</p>
     <div class="toolbar" style="margin-top:14px"><button class="btn" type="button" data-up="export-result">결과 내려받기 (오류 내역 포함)</button>${s.dups ? `<button class="btn ghost" type="button" data-view="duplicates">중복 확인으로 이동</button>` : ''}<button class="btn ghost" type="button" data-up="go-people">참여자 DB에서 보기</button><button class="btn ghost" type="button" data-up="reset">새 파일 올리기</button></div></div>`;
 }
@@ -1634,7 +1649,7 @@ document.addEventListener('click', async ev => {
     if(a === 'analyze') return analyzeUpload();
     if(a === 'to-map'){ u.step = 'map'; u.err = ''; return renderMain(); }
     if(a === 'commit'){ const c = upCounts(u.rows); const nNew = u.rows.filter(r => !r.errors.length && r.decision === 'new').length, nLink = u.rows.filter(r => !r.errors.length && r.decision === 'link').length;
-      return modal(`<h3>${fmtNum(nNew + nLink)}행을 반영할까요?</h3><p>신규 등록 ${fmtNum(nNew)}명, 기존 참여자에 연결 ${fmtNum(nLink)}건을 반영하고, 오류 ${fmtNum(c.error)}행과 건너뛴 ${fmtNum(c.skip)}행은 제외합니다. 반영한 뒤에도 업로드 기록에서 통째로 되돌릴 수 있습니다.</p><div class="acts"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="button" data-up="commit-go">반영</button></div>`); }
+      return modal(`<h3>${fmtNum(nNew + nLink)}행을 반영할까요?</h3><p>신규 등록 ${fmtNum(nNew)}명, 같은 사람에게 사업 참여 추가 ${fmtNum(nLink)}건을 반영하고, 오류 ${fmtNum(c.error)}행과 건너뛴 ${fmtNum(c.skip)}행은 제외합니다. 반영한 뒤에도 업로드 기록에서 통째로 되돌릴 수 있습니다.</p><div class="acts"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="button" data-up="commit-go">반영</button></div>`); }
     if(a === 'commit-go') return commitUpload();
     if(a === 'export-check') return exportUploadRows(u.rows, '업로드검사');
     if(a === 'export-result') return exportUploadRows(u.rows, `업로드${u.uploadId}_결과`);
