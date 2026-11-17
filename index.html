@@ -290,6 +290,8 @@ table.prev select{padding:4px 6px;font-size:12px}
 .dup dd.diff{color:var(--warn);font-weight:600}
 .dup .dsum{padding:8px 16px;font-size:12.5px;border-bottom:1px solid var(--line);line-height:1.6}
 .dup .hl{font-weight:700;color:var(--bad)}
+[hidden]{display:none !important}
+.pp .segs{margin:0}
 .dup .acts{display:flex;gap:8px;flex-wrap:wrap}
 
 @media (max-width:1100px){.opts{grid-template-columns:1fr}.result{grid-template-columns:repeat(3,minmax(0,1fr))}}
@@ -732,6 +734,9 @@ function makeDemoStore(){
       return {keep:keep.code, lose:lose.code, moved, dropped};
     },
     async deleteParticipant(id, reason){ const p = byId.get(id); if(!reason) throw Error('삭제 사유를 입력하세요.'); p.deleted_at = nowISO(); p.deleted_by = me.id; p.delete_reason = reason; audit('delete_participant', `participant:${id}`, {code:p.code, reason}); return {code:p.code, name:p.name}; },
+    async addEnrollment(id, prg){ let pr = db.programs.find(x => x.year === +prg.year && x.name === prg.name); if(!pr){ pr = {id:db.seq.prog++, year:+prg.year, name:prg.name, biz_name:prg.biz || prg.name, prog_name:prg.prog || null, cohort:prg.cohort || null, start_date:prg.start || null, end_date:prg.end || null}; db.programs.push(pr); progById.set(pr.id, pr); }
+      if(db.enrollments.some(e => e.participant_id === id && e.program_id === pr.id)) throw Error('이미 이 프로그램에 참여한 것으로 등록되어 있습니다: ' + pr.name);
+      db.enrollments.push({id:db.seq.enr++, participant_id:id, program_id:pr.id, completion_date:prg.completion || pr.end_date, entry_type:prg.entry_type || null}); return this.get(id); },
     async undeleteParticipant(id){ const p = byId.get(id); p.deleted_at = null; p.deleted_by = null; p.delete_reason = null; audit('undelete_participant', `participant:${id}`); return this.get(id); },
     async listDeleted(q = '', page = 1, size = 50){ const rows = db.participants.filter(p => p.deleted_at && !p.merged_into_id && (!q || p.name.includes(q) || p.code.includes(q))).sort((a, b) => b.deleted_at.localeCompare(a.deleted_at)); return {total:rows.length, rows:rows.slice((page - 1) * size, page * size).map(p => ({...view(p), deleted_by_name:adminName(p.deleted_by)}))}; },
     async purgeParticipant(id, code){ if(me.role !== 'owner') throw Error('최고관리자만 할 수 있는 작업입니다.'); const p = byId.get(id); if(code !== p.code) throw Error('확인용 관리번호가 맞지 않습니다.'); db.participants.splice(db.participants.indexOf(p), 1); byId.delete(id); db.enrollments = db.enrollments.filter(e => e.participant_id !== id); audit('purge_participant', p.code); return {code:p.code}; },
@@ -846,6 +851,7 @@ function makeSupabaseStore(cfg){
     async dismissDuplicate(dupId){ await rpc('dismiss_duplicate', {dup_id:dupId}); },
     async deleteParticipant(id, reason){ return rpc('delete_participant', {pid:id, reason}); },
     async undeleteParticipant(id){ return rpc('undelete_participant', {pid:id}); },
+    async addEnrollment(id, prg){ const r = await rpc('add_enrollment', {pid:id, prg}); await refreshCaches(); return r; },
     async listDeleted(q = '', page = 1, size = 50){ return rpc('list_deleted_participants', {q, page, size}); },
     async purgeParticipant(id, code){ return rpc('purge_participant', {pid:id, confirm_code:code}); },
     async dupCount(){ try{ return await rpc('dup_count'); }catch{ const r = await q(sb.from('duplicate_candidates').select('id', {count:'exact', head:true}).eq('status', 'pending')); return r?.count || 0; } },
@@ -1140,7 +1146,7 @@ async function dupView_old(){
   return `<div class="head"><div><h1>중복 확인</h1><p>STEP 3에서 통합 기능을 구현합니다. 현재 가상 데이터에 이름·생년월일이 같은 의심 쌍이 ${s.dups}건 있습니다.</p></div></div>
   <div class="panel"><p style="margin:0;color:var(--sub);font-size:13px;line-height:1.7">판단 기준: 휴대전화 일치(100점) → 이메일 일치(90점) → 이름+생년월일 일치(70점) → 이름만 일치(30점, 참고). 자동 통합은 하지 않고, 관리자가 확인한 뒤 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고 다른 쪽은 '통합됨'으로 보존합니다. 참여자 상세 화면의 기본 정보 탭 상단에서도 의심 대상을 확인할 수 있습니다.</p></div>`;
 }
-const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제'};
+const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가'};
 async function logsView(){
   const l = await store.auditLog();
   return `<div class="head"><div><h1>작업 기록</h1><p>로그인, 상세 조회, 수정, 다운로드가 자동으로 남습니다. 기록은 수정하거나 지울 수 없습니다. 최고관리자만 볼 수 있습니다.</p></div></div>
@@ -1209,7 +1215,9 @@ function regionFix(t){
     const dl = document.getElementById(`${pre}-dl-gu`); if(dl) dl.innerHTML = guOptions(sEl?.value);
   }
 }
-document.addEventListener('change', ev => { if(ev.target.dataset?.region) regionFix(ev.target); });
+document.addEventListener('change', ev => { if(ev.target.dataset?.region) regionFix(ev.target);
+  if(ev.target.dataset?.ppyear){ const pre = ev.target.dataset.ppyear; const s = document.getElementById(`${pre}-pid`); if(s) s.innerHTML = ppOptions(ev.target.value); ppHint(pre); } });
+document.addEventListener('input', ev => { const fs = ev.target.closest?.('[data-pp]'); if(fs && fs.dataset.mode === 'new') ppHint(fs.dataset.pp); });
 
 /* ---------- 상세 패널 ---------- */
 const FIELDS = [
@@ -1273,7 +1281,7 @@ function drawer(){
       + (statusChanged ? `<div class="f wide"><label for="d-reason">상태 변경 사유 (이력에 남음)</label><input class="input" id="d-reason" data-reason value="${E(st.reason)}" placeholder="예: 10/28 전화 확인, 사후관리 설문 응답"></div>` : '');
   } else if(st.tab === 'enroll'){
     body = p.enroll.length ? p.enroll.map(e => `<div class="card"><div class="ct"><b>${E(e.program.name)}</b><span class="tag">${e.program.year}년</span></div><dl><dt>사업명</dt><dd>${E(bizOf(e.program))}</dd><dt>프로그램명</dt><dd>${E(e.program.prog_name || '-')}</dd><dt>기수</dt><dd>${E(e.program.cohort || '-')}</dd><dt>운영기간</dt><dd class="num">${fmtD(e.program.start_date)} ~ ${fmtD(e.program.end_date)}</dd><dt>수료일</dt><dd class="num">${fmtD(e.completion_date) || '-'}</dd><dt>참여 당시 유형</dt><dd>${E(e.entry_type || '-')}</dd></dl></div>`).join('') : '<div class="empty">사업 참여 이력이 없습니다.</div>';
-    body += `<p style="margin:0;font-size:12px;color:var(--sub)">사업 참여 이력은 엑셀 업로드(STEP 3)로 추가됩니다.</p>`;
+    body = (st.user.role !== 'viewer' ? `<div class="ct" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">새 프로그램도 직접 입력해 추가할 수 있습니다. 여러 명은 엑셀 업로드를 이용하세요.</span><button class="btn sm" type="button" data-act="add-enroll">사업 참여 추가</button></div>` : '') + body;
   } else if(st.tab === 'emp'){
     body = `<div class="ct" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">새 직장을 등록하면 이전 직장은 종료일과 함께 이력으로 남습니다.</span><button class="btn sm" type="button" data-act="add-emp">취업·창업 등록</button></div>`
       + (p.emps.length ? p.emps.map(e => `<div class="card ${e.is_current ? 'cur' : ''}"><div class="ct"><b>${E(e.company || '(회사명 없음)')}</b>${e.is_current ? `<span class="chip s-${e.kind === 'startup' ? 'startup' : 'employed'}">${e.kind === 'startup' ? '창업 중' : '재직 중'}</span>` : '<span class="tag">종료</span>'}</div>
@@ -1330,7 +1338,7 @@ async function doRestore(fd){
     st.detail = p; st.draft = draftFrom(p); st.errs = {}; st.reason = ''; refreshDrawer(); toast('이전 값으로 복구했습니다. 변경 이력에 복구 기록이 남았습니다.'); renderMain();
   }catch(e){ $('#rs-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; }
 }
-const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', delete_reason:'삭제 사유', birth_year:'출생 연도', consent_marketing:'마케팅 수신 동의'};
+const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', delete_reason:'삭제 사유', birth_year:'출생 연도', enrollment:'사업 참여 추가', consent_marketing:'마케팅 수신 동의'};
 function fmtVal(f, v){ if(v == null) return ''; if(f === 'birth_date') return birthToYY(String(v)); if(f.startsWith('consent')) return v === true || v === 'true' ? '동의' : v === false || v === 'false' ? '미동의' : ''; return String(v); }
 function refreshDrawer(keepScroll = true){
   const old = document.querySelector('.drawer'); const sc = $('#dbody')?.scrollTop || 0; const focusId = document.activeElement?.id; const sel = document.activeElement?.selectionStart;
@@ -1915,6 +1923,59 @@ function pwModal(){
   <div id="pw-err" class="f"></div></div>
   <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">변경</button></div></form>`);
 }
+/* ---------- 프로그램 선택 · 직접 입력 (참여자 등록 · 사업 참여 추가 공용) ---------- */
+function progPicker(pre, opt = {}){
+  const y = new Date().getFullYear(); const progs = store.programs();
+  const yearsOpt = [...new Set([y + 1, y, y - 1, y - 2, ...progs.map(p => p.year)])].sort((a, b) => b - a);
+  return `<fieldset class="pp" data-pp="${pre}" data-mode="exist"><legend>참여 사업 · 프로그램${opt.optional ? ' (선택)' : ''}</legend>
+    <div class="f wide"><div class="segs" role="radiogroup" aria-label="입력 방식"><button type="button" class="seg on" data-ppmode="${pre}:exist">기존 프로그램에서 선택</button><button type="button" class="seg" data-ppmode="${pre}:new">새 프로그램 직접 입력</button></div></div>
+    <div class="f"><label for="${pre}-year">사업 연도</label><select class="select" id="${pre}-year" name="pp_year" data-ppyear="${pre}">${yearsOpt.map(v => `<option ${v === y ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+    <div class="f pp-exist"><label for="${pre}-pid">프로그램</label><select class="select" id="${pre}-pid" name="pp_pid">${ppOptions(y)}</select></div>
+    <div class="f pp-new" hidden><label for="${pre}-biz">사업명 *</label><input class="input" id="${pre}-biz" name="pp_biz" list="${pre}-dl-biz" autocomplete="off" placeholder="예: 서울형 청년인턴"><datalist id="${pre}-dl-biz">${[...new Set(progs.map(bizOf))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
+    <div class="f pp-new" hidden><label for="${pre}-prog">프로그램명</label><input class="input" id="${pre}-prog" name="pp_prog" list="${pre}-dl-prog" autocomplete="off" placeholder="예: 직무캠프"><datalist id="${pre}-dl-prog">${[...new Set(progs.map(p => p.prog_name).filter(Boolean))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
+    <div class="f pp-new" hidden><label for="${pre}-cohort">기수</label><input class="input" id="${pre}-cohort" name="pp_cohort" autocomplete="off" placeholder="예: 1기"></div>
+    <div class="f pp-new" hidden><label for="${pre}-start">운영 시작일</label><input class="input" id="${pre}-start" name="pp_start" type="date"></div>
+    <div class="f pp-new" hidden><label for="${pre}-end">운영 종료일</label><input class="input" id="${pre}-end" name="pp_end" type="date"></div>
+    <div class="f"><label for="${pre}-done">수료일</label><input class="input" id="${pre}-done" name="pp_done" type="date"><span class="hint">비우면 운영 종료일로 저장</span></div>
+    <div class="f"><label for="${pre}-entry">구직 상태(참여 당시)</label><input class="input" id="${pre}-entry" name="pp_entry" placeholder="예: 구직, 재학"></div>
+    <div class="f wide pp-new" hidden><span class="hint" id="${pre}-hint">목록에 없는 프로그램은 저장할 때 새로 만들어집니다.</span></div>
+  </fieldset>`;
+}
+function ppOptions(year){
+  const ps = store.programs().filter(p => p.year === +year).sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+  return `<option value="">${ps.length ? '프로그램을 고르세요' : '이 연도에 등록된 프로그램이 없습니다 → 새 프로그램 직접 입력'}</option>` + ps.map(p => `<option value="${p.id}">${E(p.name)}${p.start_date ? ` (${fmtD(p.start_date)}~${fmtD(p.end_date)})` : ''}</option>`).join('');
+}
+function ppMode(pre, mode){
+  const fs = document.querySelector(`[data-pp="${pre}"]`); if(!fs) return; fs.dataset.mode = mode;
+  fs.querySelectorAll('.pp-new').forEach(e => e.hidden = mode !== 'new'); fs.querySelectorAll('.pp-exist').forEach(e => e.hidden = mode === 'new');
+  fs.querySelectorAll('[data-ppmode]').forEach(b => b.classList.toggle('on', b.dataset.ppmode === `${pre}:${mode}`));
+  ppHint(pre);
+}
+function ppHint(pre){
+  const fs = document.querySelector(`[data-pp="${pre}"]`); const h = document.getElementById(`${pre}-hint`); if(!fs || !h) return;
+  const v = id => (document.getElementById(`${pre}-${id}`)?.value || '').trim(); const coh = /^\d+$/.test(v('cohort')) ? v('cohort') + '기' : v('cohort');
+  const nm = progLabel(v('biz'), v('prog'), coh); const yr = +v('year');
+  const hit = nm && store.programs().find(p => p.year === yr && p.name === nm);
+  h.textContent = !nm ? '목록에 없는 프로그램은 저장할 때 새로 만들어집니다.' : hit ? `'${yr} ${nm}'은(는) 이미 있는 프로그램이라 그 프로그램에 추가됩니다.` : `'${yr} ${nm}'을(를) 새 프로그램으로 만들어 등록합니다.`;
+}
+// 폼 값 → 서버로 보낼 프로그램 정보. 아무것도 안 고르면 null, 잘못되면 {err}
+function ppRead(fd, pre){
+  const fs = document.querySelector(`[data-pp="${pre}"]`); const g = k => String(fd.get(k) || '').trim();
+  const extra = {completion:g('pp_done') || null, entry_type:g('pp_entry') || null};
+  if(fs?.dataset.mode === 'new'){
+    if(!g('pp_biz')){ return (g('pp_prog') || g('pp_cohort')) ? {err:'새 프로그램의 사업명을 입력하세요.'} : null; }
+    const coh = /^\d+$/.test(g('pp_cohort')) ? g('pp_cohort') + '기' : g('pp_cohort');
+    if(g('pp_start') && g('pp_end') && g('pp_end') < g('pp_start')) return {err:'운영 종료일이 시작일보다 빠릅니다.'};
+    return {year:+g('pp_year'), name:progLabel(g('pp_biz'), g('pp_prog'), coh), biz:g('pp_biz'), prog:g('pp_prog'), cohort:coh, start:g('pp_start') || null, end:g('pp_end') || null, ...extra};
+  }
+  const p = store.programs().find(x => x.id === +g('pp_pid')); if(!p) return null;
+  return {year:p.year, name:p.name, ...extra};
+}
+function enrollModal(){
+  modal(`<h3>사업 참여 추가</h3><p>${E(st.detail.name)} (${st.detail.code})에게 사업 참여를 추가합니다. 목록에 없는 프로그램은 [새 프로그램 직접 입력]으로 만들 수 있습니다. 추가한 내용은 변경 이력에 남습니다.</p>
+  <form id="enrollForm" novalidate>${progPicker('ae')}<div id="ae-err" style="margin-top:10px"></div>
+  <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">추가</button></div></form>`);
+}
 function personModal(){
   const progs = store.programs();
   modal(`<h3>참여자 등록</h3><p>한 명씩 직접 등록합니다. 여러 명은 엑셀 업로드를 이용하세요. 같은 휴대전화·이메일이 있으면 중복 의심으로 표시됩니다.</p>
@@ -1927,11 +1988,7 @@ function personModal(){
     <div class="f"><label for="np-sido">거주지 시·도</label><input class="input" id="np-sido" name="residence_sido" list="np-dl-sido" autocomplete="off" data-region="np" data-part="sido" placeholder="서울 → 서울특별시"></div>
     <div class="f"><label for="np-gu">거주지 구·시·군</label><input class="input" id="np-gu" name="residence_gu" list="np-dl-gu" autocomplete="off" data-region="np" data-part="gu" placeholder="관악 → 관악구">${regionLists('np', '')}</div>
     <div class="f"><label for="np-job">희망직무</label><select class="select" id="np-job" name="desired_job"><option value="">선택 안 함</option>${JOBS.map(j => `<option>${j}</option>`).join('')}</select></div>
-    <div class="f"><label for="np-year">사업 연도</label><input class="input" id="np-year" name="year" value="${new Date().getFullYear()}" inputmode="numeric"></div>
-    <div class="f"><label for="np-program">사업명</label><input class="input" id="np-program" name="program" list="np-programs" placeholder="목록에서 고르거나 새로 입력"><datalist id="np-programs">${[...new Set(progs.map(bizOf))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
-    <div class="f"><label for="np-prog">프로그램명</label><input class="input" id="np-prog" name="prog" list="np-progs" placeholder="선택 입력"><datalist id="np-progs">${[...new Set(progs.map(p => p.prog_name).filter(Boolean))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
-    <div class="f"><label for="np-cohort">기수</label><input class="input" id="np-cohort" name="cohort" placeholder="예: 1기 (선택 입력)"></div>
-  </fieldset><div id="np-err" style="margin-top:10px"></div>
+  </fieldset>${progPicker('np', {optional:true})}<div id="np-err" style="margin-top:10px"></div>
   <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">등록</button></div></form>`);
 }
 async function submitPerson(fd){
@@ -1940,11 +1997,10 @@ async function submitPerson(fd){
   const phone = g('phone') ? normPhone(g('phone')) : null; if(g('phone') && !phone) return err('휴대전화는 010으로 시작하는 번호로 입력하세요.');
   const email = g('email') ? g('email').toLowerCase() : null; if(email && !validEmail(email)) return err('이메일 형식이 맞지 않습니다.');
   const birth = g('birth') ? yyToBirth(g('birth').replace(/^(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3')) : null; if(g('birth') && !birth) return err('생년월일은 YY-MM-DD 형식으로 입력하세요. 예: 98-03-15');
-  if(g('program') && !/^\d{4}$/.test(g('year'))) return err('사업 연도를 네 자리로 입력하세요.');
+  const prog = ppRead(fd, 'np'); if(prog?.err) return err(prog.err);
   const data = {name:g('name'), current_status:g('current_status') || 'unknown', phone, email, birth_date:birth, desired_job:g('desired_job') || null, residence_sido:normSido(g('residence_sido')) || null, residence_gu:g('residence_gu') || null};
   try{
-    const coh = /^\d+$/.test(g('cohort')) ? g('cohort') + '기' : g('cohort');
-    const p = await store.create(data, g('program') ? {year:+g('year'), name:progLabel(g('program'), g('prog'), coh), biz:g('program'), prog:g('prog'), cohort:coh} : null);
+    const p = await store.create(data, prog);
     closeModal(); toast(`${p.name}님을 ${p.code}로 등록했습니다.${p.dup && p.dup.length ? ` 중복 의심 ${p.dup.length}건이 있습니다.` : ''}`);
     st.detail = p; st.draft = draftFrom(p); st.errs = {}; st.tab = 'info'; await renderMain(); refreshDrawer(false);
   }catch(e){ err(e.message); }
@@ -2038,6 +2094,7 @@ document.addEventListener('click', async ev => {
   if((el = q('[data-go-biz]'))){ const i = el.dataset.goBiz.indexOf('|'); st.f = {q:'', year:el.dataset.goBiz.slice(0, i), biz:el.dataset.goBiz.slice(i + 1), program:'all', status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
   if((el = q('[data-go-program]'))){ const p = store.programs().find(x => x.id === +el.dataset.goProgram); st.f = {q:'', year:String(p.year), biz:bizOf(p), program:String(p.id), status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
   if((el = q('[data-open]'))){ ev.preventDefault(); return openDetail(+el.dataset.open); }
+  if((el = q('[data-ppmode]'))){ const [pre, mode] = el.dataset.ppmode.split(':'); return ppMode(pre, mode); }
   if((el = q('[data-restore]'))){ const [k, i] = el.dataset.restore.split(':'); return restoreModal(k, +i); }
   if((el = q('[data-hsrc]'))){ st.histSrc = el.dataset.hsrc; return refreshDrawer(); }
   if((el = q('[data-sort]'))){ const k = el.dataset.sort; if(st.view !== 'people') return; st.dir = st.sort === k && st.dir === 'desc' ? 'asc' : 'desc'; st.sort = k; st.page = 1; return renderMain(); }
@@ -2070,6 +2127,7 @@ document.addEventListener('click', async ev => {
     if(a === 'add-emp') return empModal();
     if(a === 'new-person') return personModal();
     if(a === 'del-person') return delModal();
+    if(a === 'add-enroll') return enrollModal();
     if(a === 'trash'){ st.trash = true; st.tpage = 1; st.trashQ = ''; if(st.detail) closeDetail(true); return renderMain(); }
     if(a === 'trash-close'){ st.trash = false; return renderMain(); }
   }
@@ -2111,6 +2169,9 @@ async function handleSubmit(f){
   if(f.id === 'dupfilters'){ st.dupf.q = String(fd.get('q') || '').trim(); st.dpage = 1; return renderMain(); }
   if(f.id === 'restoreForm') return doRestore(fd);
   if(f.id === 'personForm') return submitPerson(fd);
+  if(f.id === 'enrollForm'){ const prog = ppRead(fd, 'ae'); const err = m => { $('#ae-err').innerHTML = `<div class="issues">${E(m)}</div>`; };
+    if(!prog) return err('프로그램을 고르거나 새 프로그램의 사업명을 입력하세요.'); if(prog.err) return err(prog.err);
+    try{ st.detail = await store.addEnrollment(st.detail.id, prog); st.draft = draftFrom(st.detail); closeModal(); refreshDrawer(); renderMain(); toast(`${prog.year} ${prog.name} 참여를 추가했습니다.`); }catch(e){ err(e.message); } return; }
   if(f.id === 'trashfilters'){ st.trashQ = String(fd.get('q') || '').trim(); st.tpage = 1; return renderMain(); }
   if(f.id === 'delForm'){ const reason = String(fd.get('reason') || '').trim(); if(!reason){ $('#del-err').innerHTML = '<div class="issues">삭제 사유를 입력하세요.</div>'; return; }
     try{ const r = await store.deleteParticipant(st.detail.id, reason); closeModal(); closeDetail(true); toast(`${r.name}(${r.code})을 삭제했습니다. '삭제한 참여자'에서 복구할 수 있습니다.`); renderMain(); }catch(e){ $('#del-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; } return; }
