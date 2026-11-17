@@ -728,6 +728,10 @@ function makeDemoStore(){
       audit('merge', `participant:${keepId}`, {merged:lose.code, moved, dropped});
       return {keep:keep.code, lose:lose.code, moved, dropped};
     },
+    async deleteParticipant(id, reason){ const p = byId.get(id); if(!reason) throw Error('삭제 사유를 입력하세요.'); p.deleted_at = nowISO(); p.deleted_by = me.id; p.delete_reason = reason; audit('delete_participant', `participant:${id}`, {code:p.code, reason}); return {code:p.code, name:p.name}; },
+    async undeleteParticipant(id){ const p = byId.get(id); p.deleted_at = null; p.deleted_by = null; p.delete_reason = null; audit('undelete_participant', `participant:${id}`); return this.get(id); },
+    async listDeleted(q = '', page = 1, size = 50){ const rows = db.participants.filter(p => p.deleted_at && !p.merged_into_id && (!q || p.name.includes(q) || p.code.includes(q))).sort((a, b) => b.deleted_at.localeCompare(a.deleted_at)); return {total:rows.length, rows:rows.slice((page - 1) * size, page * size).map(p => ({...view(p), deleted_by_name:adminName(p.deleted_by)}))}; },
+    async purgeParticipant(id, code){ if(me.role !== 'owner') throw Error('최고관리자만 할 수 있는 작업입니다.'); const p = byId.get(id); if(code !== p.code) throw Error('확인용 관리번호가 맞지 않습니다.'); db.participants.splice(db.participants.indexOf(p), 1); byId.delete(id); db.enrollments = db.enrollments.filter(e => e.participant_id !== id); audit('purge_participant', p.code); return {code:p.code}; },
     async dismissDuplicate(dupId){ const d = db.duplicates.find(x => x.id === dupId); d.status = 'dismissed'; d.resolved_by = me.id; d.resolved_at = nowISO(); audit('dismiss_duplicate', `duplicate:${dupId}`); },
     /* --- 백업 --- */
     async backup(){
@@ -837,6 +841,10 @@ function makeSupabaseStore(cfg){
     async restoreChange(kind, ref, reason){ return rpc('restore_change', {kind, ref, reason: reason || null}); },
     async merge(dupId, keepId){ const r = await rpc('merge_participants', {dup_id:dupId, keep_id:keepId}); await refreshCaches(); return r; },
     async dismissDuplicate(dupId){ await rpc('dismiss_duplicate', {dup_id:dupId}); },
+    async deleteParticipant(id, reason){ return rpc('delete_participant', {pid:id, reason}); },
+    async undeleteParticipant(id){ return rpc('undelete_participant', {pid:id}); },
+    async listDeleted(q = '', page = 1, size = 50){ return rpc('list_deleted_participants', {q, page, size}); },
+    async purgeParticipant(id, code){ return rpc('purge_participant', {pid:id, confirm_code:code}); },
     async dupCount(){ try{ return await rpc('dup_count'); }catch{ const r = await q(sb.from('duplicate_candidates').select('id', {count:'exact', head:true}).eq('status', 'pending')); return r?.count || 0; } },
     /* 백업 · 운영 */
     async backup(){
@@ -1048,12 +1056,14 @@ function pager(total, page, size, attr, unit = '명'){
     <div class="pg"><button type="button" ${attr}="${Math.max(1,page-1)}" ${page === 1 ? 'disabled' : ''} aria-label="이전 쪽">‹</button>${btns.join('')}<button type="button" ${attr}="${Math.min(pages,page+1)}" ${page === pages ? 'disabled' : ''} aria-label="다음 쪽">›</button></div></div>`;
 }
 async function peopleView(){
+  if(st.trash) return trashView();
   const {total, rows} = await store.list(st.f, st.sort, st.dir, st.page, st.size);
   return `<div class="head"><div><h1>참여자 통합 DB</h1><p>한 사람은 한 줄로 관리하고, 여러 사업 참여는 '외 n건'으로 표시합니다. 줄을 누르면 상세 정보가 열립니다.</p></div>${st.user.role !== 'viewer' ? '<button class="btn" type="button" data-act="new-person">참여자 등록</button>' : ''}</div>
   <div class="panel">${filterBar(st.f)}
     <div class="tablebar"><span class="count">검색 결과 <b>${fmtNum(total)}</b>명</span>
       <div class="toolbar">
         <div class="pop"><button class="btn ghost sm" type="button" data-act="cols" aria-expanded="${st.colOpen}">표시할 열 (${st.cols.length})</button>${st.colOpen ? colPicker() : ''}</div>
+        <button class="btn ghost sm" type="button" data-act="trash">삭제한 참여자</button>
         <button class="btn sm" type="button" data-act="export" ${total ? '' : 'disabled'}>엑셀 다운로드 (${fmtNum(total)}명)</button>
       </div></div>
     ${tableHTML(rows, st.cols, st.sort, st.dir, st.detail?.id)}
@@ -1063,6 +1073,30 @@ async function peopleView(){
 function colPicker(){
   return `<div class="popbox" role="dialog" aria-label="표시할 열">${COLS.map(c => `<label><input type="checkbox" data-col="${c.key}" ${st.cols.includes(c.key) ? 'checked' : ''} ${c.key === 'name' ? 'disabled' : ''}> ${c.label}</label>`).join('')}
     <div class="pf"><button class="link" type="button" data-act="cols-default">기본 열로</button><button class="link" type="button" data-act="cols-all">전체 선택</button><button class="btn sm" type="button" data-act="cols">닫기</button></div></div>`;
+}
+
+async function trashView(){
+  const r = await store.listDeleted(st.trashQ || '', st.tpage || 1, 50); const canEdit = st.user.role !== 'viewer', owner = st.user.role === 'owner';
+  return `<div class="head"><div><h1>삭제한 참여자</h1><p>삭제한 참여자는 목록·검색·통계·중복 확인에서 빠지고 여기에 보관됩니다. [복구]하면 원래대로 돌아갑니다.${owner ? ' 개인정보 파기 요청이 있으면 [영구 삭제]로 참여·취업·변경 이력까지 완전히 지울 수 있습니다(되돌릴 수 없음).' : ''}</p></div><button class="btn ghost" type="button" data-act="trash-close">참여자 통합 DB로 돌아가기</button></div>
+  <div class="panel"><form class="toolbar" id="trashfilters" role="search"><input class="input search" name="q" placeholder="이름 · 관리번호" value="${E(st.trashQ || '')}" aria-label="검색어"><button class="btn" type="submit">검색</button></form>
+    <div class="tablebar"><span class="count"><b>${fmtNum(r.total)}</b>명</span></div>
+    ${r.rows.length ? `<div class="tw"><table class="grid"><thead><tr><th>관리번호</th><th>이름</th><th>참여 사업</th><th>삭제일</th><th>삭제한 사람</th><th>삭제 사유</th><th></th></tr></thead><tbody>
+    ${r.rows.map(p => `<tr><td class="code">${p.code}</td><td class="name">${E(p.name)}</td><td>${p.latest ? `${E(p.latest.name)}${p.enroll.length > 1 ? ` <span class="tag">외 ${p.enroll.length - 1}건</span>` : ''}` : '-'}</td><td class="num">${fmtDT(p.deleted_at)}</td><td>${E(p.deleted_by_name || '')}</td><td>${E(p.delete_reason || '')}</td>
+      <td><div class="toolbar" style="flex-wrap:nowrap">${canEdit ? `<button class="btn ghost sm" type="button" data-undel="${p.id}">복구</button>` : ''}${owner ? `<button class="btn danger sm" type="button" data-purge="${p.id}:${p.code}">영구 삭제</button>` : ''}</div></td></tr>`).join('')}
+    </tbody></table></div>${pager(r.total, st.tpage || 1, 50, 'data-tpage')}` : '<div class="tw"><div class="empty">삭제한 참여자가 없습니다.</div></div>'}</div>`;
+}
+function delModal(){
+  const p = st.detail;
+  modal(`<h3>${E(p.name)} (${p.code}) 삭제</h3><p>참여자 목록·검색·통계·중복 확인에서 빠지고 '삭제한 참여자'에 보관됩니다. 사업 참여·취업 기록과 변경 이력은 그대로 남아 있어 언제든 복구할 수 있습니다.</p>
+  <form id="delForm" novalidate><div class="f wide"><label for="del-reason">삭제 사유 *</label><input class="input" id="del-reason" name="reason" placeholder="예: 테스트로 잘못 등록, 중복 등록, 본인 삭제 요청" required></div>
+  <div id="del-err" style="margin-top:8px"></div>
+  <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn danger" type="submit">삭제</button></div></form>`);
+}
+function purgeModal(id, code){
+  modal(`<h3>영구 삭제 (${code})</h3><p>이 참여자의 개인정보, 사업 참여, 취업 기록, 상태·변경 이력, 동의 기록, 설문 응답을 <b>완전히 지웁니다. 되돌릴 수 없습니다.</b> 개인정보 파기 요청처럼 꼭 필요할 때만 사용하세요. 작업 기록에는 관리번호만 남습니다.</p>
+  <form id="purgeForm" novalidate data-pid="${id}"><div class="f wide"><label for="pg-code">확인을 위해 관리번호 <b>${code}</b>를 그대로 입력하세요</label><input class="input" id="pg-code" name="code" autocomplete="off" placeholder="${code}"></div>
+  <div id="pg-err" style="margin-top:8px"></div>
+  <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn danger" type="submit">영구 삭제</button></div></form>`);
 }
 
 /* ---------- 취업 현황 관리 ---------- */
@@ -1092,7 +1126,7 @@ async function dupView_old(){
   return `<div class="head"><div><h1>중복 확인</h1><p>STEP 3에서 통합 기능을 구현합니다. 현재 가상 데이터에 이름·생년월일이 같은 의심 쌍이 ${s.dups}건 있습니다.</p></div></div>
   <div class="panel"><p style="margin:0;color:var(--sub);font-size:13px;line-height:1.7">판단 기준: 휴대전화 일치(100점) → 이메일 일치(90점) → 이름+생년월일 일치(70점) → 이름만 일치(30점, 참고). 자동 통합은 하지 않고, 관리자가 확인한 뒤 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고 다른 쪽은 '통합됨'으로 보존합니다. 참여자 상세 화면의 기본 정보 탭 상단에서도 의심 대상을 확인할 수 있습니다.</p></div>`;
 }
-const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구'};
+const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제'};
 async function logsView(){
   const l = await store.auditLog();
   return `<div class="head"><div><h1>작업 기록</h1><p>로그인, 상세 조회, 수정, 다운로드가 자동으로 남습니다. 기록은 수정하거나 지울 수 없습니다. 최고관리자만 볼 수 있습니다.</p></div></div>
@@ -1238,7 +1272,7 @@ function drawer(){
   <aside class="drawer" role="dialog" aria-modal="true" aria-label="${E(p.name)} 상세 정보">
     <div class="dh"><div class="t"><div><h2>${E(p.name)} ${chip(p.current_status)}</h2>
       <div class="meta"><span class="mono">${p.code}</span><span>최초 등록 ${fmtD(p.created_at)}</span><span>최종 수정 ${fmtDT(p.updated_at)} · ${E(p.updated_by_name)}</span></div></div>
-      <button class="btn ghost sm" type="button" data-act="close" aria-label="닫기">닫기</button></div>
+      <div class="toolbar">${st.user.role !== 'viewer' && !p.deleted_at ? '<button class="btn danger sm" type="button" data-act="del-person">삭제</button>' : ''}<button class="btn ghost sm" type="button" data-act="close" aria-label="닫기">닫기</button></div></div>
       <div class="tabs" role="tablist">${tabs.map(([k,l]) => `<button type="button" role="tab" data-tab="${k}" class="${st.tab === k ? 'on' : ''}" aria-selected="${st.tab === k}">${l}</button>`).join('')}</div></div>
     <div class="db" id="dbody">${body}</div>
     ${st.tab === 'info' ? `<div class="df"><span class="msg">${dirty.length ? `수정한 항목 ${dirty.length}개 · 저장하면 변경 이력에 남습니다` : '수정할 항목을 바로 고치면 됩니다'}</span>
@@ -1251,7 +1285,7 @@ function histItems(p){
   const canEdit = st.user.role !== 'viewer';
   return [...p.hist.map(h => ({kind:'status', id:h.id, at:h.changed_at, by:h.by, src:h.source || 'legacy', reason:h.reason, can: canEdit && !!h.from_status && h.from_status !== p.current_status,
       html:`<b>현재상태</b> ${h.from_status ? `${chip(h.from_status)} → ` : ''}${chip(h.to_status)}`, label:'현재상태', from:h.from_status ? STATUS[h.from_status] : '', to:STATUS[h.to_status], cur:STATUS[p.current_status]})),
-    ...p.chg.map(c => ({kind:'field', id:c.id, at:c.changed_at, by:c.by, src:c.source || 'legacy', reason:c.reason, can: canEdit && RESTORABLE.has(c.field) && String(p[c.field] ?? '') !== String(c.old_value ?? '') && !(c.field === 'name' && !c.old_value),
+    ...p.chg.filter(c => !['deleted_by','delete_reason'].includes(c.field)).map(c => c.field === 'deleted_at' ? ({kind:'meta', id:c.id, at:c.changed_at, by:c.by, src:c.source || 'legacy', reason:c.reason, can:false, html:`<b>${c.new_value ? '참여자 삭제' : '삭제 취소(복구)'}</b>`}) : ({kind:'field', id:c.id, at:c.changed_at, by:c.by, src:c.source || 'legacy', reason:c.reason, can: canEdit && RESTORABLE.has(c.field) && String(p[c.field] ?? '') !== String(c.old_value ?? '') && !(c.field === 'name' && !c.old_value),
       html:`<b>${E(FIELD_LABEL[c.field] || c.field)}</b> ${c.old_value != null && c.old_value !== '' ? `<s>${E(fmtVal(c.field, c.old_value))}</s> → ` : ''}${E(fmtVal(c.field, c.new_value) || '(빈 값)')}`,
       label:FIELD_LABEL[c.field] || c.field, from:fmtVal(c.field, c.old_value), to:fmtVal(c.field, c.new_value), cur:fmtVal(c.field, p[c.field] == null ? null : String(p[c.field]))}))]
     .sort((a,b) => b.at.localeCompare(a.at) || b.id - a.id);
@@ -1278,7 +1312,7 @@ async function doRestore(fd){
     st.detail = p; st.draft = draftFrom(p); st.errs = {}; st.reason = ''; refreshDrawer(); toast('이전 값으로 복구했습니다. 변경 이력에 복구 기록이 남았습니다.'); renderMain();
   }catch(e){ $('#rs-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; }
 }
-const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', consent_marketing:'마케팅 수신 동의'};
+const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', delete_reason:'삭제 사유', birth_year:'출생 연도', consent_marketing:'마케팅 수신 동의'};
 function fmtVal(f, v){ if(v == null) return ''; if(f === 'birth_date') return birthToYY(String(v)); if(f.startsWith('consent')) return v === true || v === 'true' ? '동의' : v === false || v === 'false' ? '미동의' : ''; return String(v); }
 function refreshDrawer(keepScroll = true){
   const old = document.querySelector('.drawer'); const sc = $('#dbody')?.scrollTop || 0; const focusId = document.activeElement?.id; const sel = document.activeElement?.selectionStart;
@@ -1945,7 +1979,7 @@ async function exportXlsx(f, name){
 function setView(v){
   if(!VIEWS.includes(v)) v = 'dashboard';
   if(st.detail && dirtyKeys().length) return confirmClose(() => { st.detail = null; setView(v); });
-  st.view = v; st.colOpen = false; try{ if(location.hash.slice(1) !== v) location.hash = v; }catch{}
+  st.view = v; st.colOpen = false; st.trash = false; try{ if(location.hash.slice(1) !== v) location.hash = v; }catch{}
   render(); window.scrollTo(0,0);
 }
 
@@ -1961,6 +1995,9 @@ document.addEventListener('click', async ev => {
   if((el = q('[data-restore]'))){ const [k, i] = el.dataset.restore.split(':'); return restoreModal(k, +i); }
   if((el = q('[data-hsrc]'))){ st.histSrc = el.dataset.hsrc; return refreshDrawer(); }
   if((el = q('[data-sort]'))){ const k = el.dataset.sort; if(st.view !== 'people') return; st.dir = st.sort === k && st.dir === 'desc' ? 'asc' : 'desc'; st.sort = k; st.page = 1; return renderMain(); }
+  if((el = q('[data-undel]'))){ try{ const p = await store.undeleteParticipant(+el.dataset.undel); toast(`${p.name}(${p.code})을 복구했습니다.`); }catch(e){ toast(e.message); } return renderMain(); }
+  if((el = q('[data-purge]'))){ const [i, c] = el.dataset.purge.split(':'); return purgeModal(+i, c); }
+  if((el = q('[data-tpage]'))){ st.tpage = +el.dataset.tpage; return renderMain(); }
   if((el = q('[data-page]'))){ st.page = +el.dataset.page; await renderMain(); $('.tw')?.scrollTo(0,0); return; }
   if((el = q('[data-epage]'))){ st.epage = +el.dataset.epage; return renderMain(); }
   if((el = q('[data-est]'))){ st.ef.status = el.dataset.est; st.epage = 1; return renderMain(); }
@@ -1986,6 +2023,9 @@ document.addEventListener('click', async ev => {
     if(a === 'hist-all'){ closeModal(); st.tab = 'hist'; st.histSrc = 'all'; return refreshDrawer(false); }
     if(a === 'add-emp') return empModal();
     if(a === 'new-person') return personModal();
+    if(a === 'del-person') return delModal();
+    if(a === 'trash'){ st.trash = true; st.tpage = 1; st.trashQ = ''; if(st.detail) closeDetail(true); return renderMain(); }
+    if(a === 'trash-close'){ st.trash = false; return renderMain(); }
   }
   if(st.colOpen && !q('.pop')){ st.colOpen = false; renderMain(); }
 });
@@ -2025,6 +2065,11 @@ async function handleSubmit(f){
   if(f.id === 'dupfilters'){ st.dupf.q = String(fd.get('q') || '').trim(); st.dpage = 1; return renderMain(); }
   if(f.id === 'restoreForm') return doRestore(fd);
   if(f.id === 'personForm') return submitPerson(fd);
+  if(f.id === 'trashfilters'){ st.trashQ = String(fd.get('q') || '').trim(); st.tpage = 1; return renderMain(); }
+  if(f.id === 'delForm'){ const reason = String(fd.get('reason') || '').trim(); if(!reason){ $('#del-err').innerHTML = '<div class="issues">삭제 사유를 입력하세요.</div>'; return; }
+    try{ const r = await store.deleteParticipant(st.detail.id, reason); closeModal(); closeDetail(true); toast(`${r.name}(${r.code})을 삭제했습니다. '삭제한 참여자'에서 복구할 수 있습니다.`); renderMain(); }catch(e){ $('#del-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; } return; }
+  if(f.id === 'purgeForm'){ const code = String(fd.get('code') || '').trim();
+    try{ const r = await store.purgeParticipant(+f.dataset.pid, code); closeModal(); toast(`${r.code}을 영구 삭제했습니다.`); renderMain(); }catch(e){ $('#pg-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; } return; }
   if(f.id === 'adminForm'){ try{ await store.registerAdmin(String(fd.get('email')).trim(), String(fd.get('name')).trim(), fd.get('role')); toast('관리자로 등록했습니다. 임시 비밀번호로 로그인하면 비밀번호 변경을 안내합니다.'); }catch(e){ toast(e.message); } return renderMain(); }
   if(f.id === 'empForm'){
     const e = Object.fromEntries(fd); if(!e.company.trim()){ toast('회사명을 입력하세요.'); return; }
@@ -2045,7 +2090,7 @@ document.addEventListener('submit', async ev => {
   if(f.dataset.busy) return;
   f.dataset.busy = '1';
   const btns = [...f.querySelectorAll('button[type=submit]')];
-  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(!['filters','dupfilters','loginForm'].includes(f.id)) b.textContent = '처리 중…'; });
+  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(!['filters','dupfilters','trashfilters','loginForm'].includes(f.id)) b.textContent = '처리 중…'; });
   try{ await handleSubmit(f); }
   catch(e){ toast(e.message); }
   finally{ delete f.dataset.busy; if(f.isConnected) btns.forEach(b => { b.disabled = false; b.textContent = b.dataset.label; }); }
