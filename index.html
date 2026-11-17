@@ -488,10 +488,11 @@ function makeDemoStore(){
       if(f.status && f.status !== 'all' && p.current_status !== f.status) return false;
       if(f.dup === '1' && !db.duplicates.some(d => d.status === 'pending' && (d.participant_a === p.id || d.participant_b === p.id))) return false;
       if(f.job && f.job !== 'all'){ const e = curEmp(p.id); if(p.desired_job !== f.job && e?.job_title !== f.job) return false; }
-      if((f.year && f.year !== 'all') || (f.program && f.program !== 'all')){
+      if((f.year && f.year !== 'all') || (f.program && f.program !== 'all') || (f.biz && f.biz !== 'all')){
         const en = enrOf(p.id);
         if(f.year && f.year !== 'all' && !en.some(e => e.program.year === +f.year)) return false;
         if(f.program && f.program !== 'all' && !en.some(e => e.program_id === +f.program)) return false;
+        if(f.biz && f.biz !== 'all' && !en.some(e => bizOf(e.program) === f.biz && (!f.year || f.year === 'all' || e.program.year === +f.year))) return false;
       }
       if(q){
         const hit = p.name.toLowerCase().includes(q) || (p.email||'').toLowerCase().includes(q) || (qd.length >= 3 && (p.phone||'').replace(/\D/g,'').includes(qd)) || p.code.toLowerCase().includes(q);
@@ -506,7 +507,7 @@ function makeDemoStore(){
   const blank = v => v == null || v === '';
   function getProgram(p, undo){
     let pr = db.programs.find(x => x.year === p.year && x.name === p.name);
-    if(!pr){ pr = {id:db.seq.prog++, year:p.year, name:p.name, start_date:p.start || null, end_date:p.end || null}; db.programs.push(pr); progById.set(pr.id, pr); undo.push({t:'program', id:pr.id}); }
+    if(!pr){ pr = {id:db.seq.prog++, year:p.year, name:p.name, biz_name:p.biz || p.name, prog_name:p.prog || null, cohort:p.cohort || null, start_date:p.start || null, end_date:p.end || null}; db.programs.push(pr); progById.set(pr.id, pr); undo.push({t:'program', id:pr.id}); }
     else if(!pr.start_date && p.start){ undo.push({t:'progdates', id:pr.id}); pr.start_date = p.start; pr.end_date = p.end; }
     return pr;
   }
@@ -602,7 +603,9 @@ function makeDemoStore(){
       const years = [2024,2025,2026].map(y => { const en = db.enrollments.filter(e => progById.get(e.program_id).year === y); return {year:y, unique:new Set(en.map(e=>e.participant_id)).size, enrollments:en.length}; });
       const progs = db.programs.map(pr => { const en = db.enrollments.filter(e => e.program_id === pr.id); const emp = en.filter(e => ['employed','startup'].includes(byId.get(e.participant_id).current_status)).length; return {...pr, n:en.length, emp}; }).sort((a,b) => b.n - a.n);
       const recent = ps.slice().sort((a,b) => b.updated_at.localeCompare(a.updated_at)).slice(0,8).map(view);
-      return {unique:ps.length, enrollments:db.enrollments.length, by, years, progs, recent, dups: db.duplicates.filter(d => d.status === 'pending').length};
+      const bm = new Map(); db.enrollments.forEach(e => { const p = byId.get(e.participant_id); if(!p || p.merged_into_id || p.deleted_at) return; const pr = progById.get(e.program_id); const k = pr.year + '|' + bizOf(pr); if(!bm.has(k)) bm.set(k, {year:pr.year, biz:bizOf(pr), ids:new Set(), progs:new Set()}); const o = bm.get(k); o.ids.add(p.id); o.progs.add(pr.id); });
+      const biz = [...bm.values()].map(o => { const ids = [...o.ids].map(i => byId.get(i)); return {year:o.year, biz:o.biz, n:ids.length, progs:o.progs.size, emp:ids.filter(p => ['employed','startup'].includes(p.current_status)).length, unk:ids.filter(p => p.current_status === 'unknown').length}; }).sort((a, b) => b.year - a.year || b.n - a.n);
+      return {biz, unique:ps.length, enrollments:db.enrollments.length, by, years, progs, recent, dups: db.duplicates.filter(d => d.status === 'pending').length};
     },
     async list(f, sort, dir, page, size){
       let rows = filtered(f);
@@ -637,7 +640,7 @@ function makeDemoStore(){
       ['birth_date','nationality','residence_sido','residence_gu','phone','email','school','major','graduation_year','education','desired_job','note','consent_job_info','consent_marketing'].forEach(k => p[k] = data[k] ?? null);
       db.participants.push(p); byId.set(id, p);
       db.status_history.push({id:db.seq.hist++, participant_id:id, from_status:null, to_status:p.current_status, reason:'관리자 직접 등록', changed_by:me.id, changed_at:t});
-      if(program && program.name){ let pr = db.programs.find(x => x.year === +program.year && x.name === program.name); if(!pr){ pr = {id:db.seq.prog++, year:+program.year, name:program.name, start_date:program.start || null, end_date:program.end || null}; db.programs.push(pr); progById.set(pr.id, pr); } db.enrollments.push({id:db.seq.enr++, participant_id:id, program_id:pr.id, completion_date:pr.end_date}); }
+      if(program && program.name){ let pr = db.programs.find(x => x.year === +program.year && x.name === program.name); if(!pr){ pr = {id:db.seq.prog++, year:+program.year, name:program.name, biz_name:program.biz || program.name, prog_name:program.prog || null, cohort:program.cohort || null, start_date:program.start || null, end_date:program.end || null}; db.programs.push(pr); progById.set(pr.id, pr); } db.enrollments.push({id:db.seq.enr++, participant_id:id, program_id:pr.id, completion_date:pr.end_date}); }
       audit('create_participant', `participant:${id}`); return this.get(id);
     },
     async addEmployment(id, e){
@@ -875,6 +878,10 @@ const COLS = [
   {key:'nationality', label:'국적', get:r => E(r.nationality), sortv:r => r.nationality},
   {key:'residence', label:'거주지', get:r => E([r.residence_sido, r.residence_gu].filter(Boolean).join(' ')), sortv:r => (r.residence_sido||'') + (r.residence_gu||'')},
   {key:'program', label:'참여 사업(최근)', get:r => r.latest ? `${E(r.latest.name)} ${r.enroll.length > 1 ? `<span class="tag">외 ${r.enroll.length-1}건</span>` : ''}` : '', sortv:r => r.latest?.name},
+  {key:'biz', label:'사업명', get:r => r.latest ? E(bizOf(r.latest)) : '', sortv:r => r.latest ? bizOf(r.latest) : ''},
+  {key:'prog', label:'프로그램명', get:r => E(r.latest?.prog_name || ''), sortv:r => r.latest?.prog_name},
+  {key:'cohort', label:'기수', get:r => E(r.latest?.cohort || ''), sortv:r => r.latest?.cohort},
+  {key:'consent', label:'마케팅 수신', get:r => r.consent_marketing == null ? '' : r.consent_marketing ? '동의' : '미동의', sortv:r => r.consent_marketing},
   {key:'year', label:'사업 연도', get:r => r.latest ? r.latest.year : '', sortv:r => r.latest?.year},
   {key:'period', label:'운영기간', get:r => r.latest ? `<span class="num">${fmtD(r.latest.start_date)}~${fmtD(r.latest.end_date)}</span>` : '', sortv:r => r.latest?.start_date},
   {key:'school', label:'학교명', get:r => E(r.school), sortv:r => r.school},
@@ -902,8 +909,8 @@ const EMP_COLS = ['code','name','status','program','emp_start','company','indust
 const VIEWS = ['dashboard','people','employment','upload','duplicates','backup','logs','accounts'];
 const st = {
   user:null, view:'dashboard', loginErr:'', busy:false,
-  f:{q:'', year:'all', program:'all', status:'all', job:'all', dup:''}, sort:'updated_at', dir:'desc', page:1, size:50,
-  ef:{status:'unknown', year:'all'}, epage:1,
+  f:{q:'', year:'all', biz:'all', program:'all', status:'all', job:'all', dup:''}, sort:'updated_at', dir:'desc', page:1, size:50,
+  ef:{status:'unknown', year:'all', biz:'all', program:'all'}, epage:1,
   cols: store_ls.get('cl.cols') || DEFAULT_COLS, colOpen:false,
   detail:null, tab:'info', draft:null, errs:{}, reason:'', histSrc:'all',
   lastAct: Date.now(), warned:false,
@@ -1000,8 +1007,12 @@ async function dashboardView(){
     <div class="panel"><div class="ph"><h2>사업 연도별 참여 현황</h2><small>같은 해 여러 사업에 참여하면 인원은 1명, 건수는 여러 건</small></div>${yearChart(s.years)}</div>
     <div class="panel"><div class="ph"><h2>현재상태 분포</h2><small>${fmtNum(s.unique)}명</small></div>${statusStack(s.by, s.unique)}</div>
   </section>
+  ${s.biz && s.biz.length ? `<section><div class="panel"><div class="ph"><h2>사업별 사후관리 현황</h2><small>연도 · 사업명 기준 · 줄을 누르면 참여자 목록으로 이동</small></div>
+    <div class="tw" style="max-height:420px"><table class="grid"><thead><tr><th>연도</th><th>사업명</th><th>프로그램·기수</th><th>참여자</th><th>재직·창업</th><th>취업률</th><th>미확인</th></tr></thead><tbody>
+    ${s.biz.map(b => `<tr data-go-biz="${b.year}|${E(b.biz)}"><td class="num">${b.year}</td><td class="name">${E(b.biz)}</td><td class="num">${fmtNum(b.progs)}개</td><td class="num">${fmtNum(b.n)}</td><td class="num">${fmtNum(b.emp)}</td><td class="num">${b.n - b.unk ? Math.round(b.emp / (b.n - b.unk) * 100) : 0}%</td><td class="num">${fmtNum(b.unk)}</td></tr>`).join('')}
+    </tbody></table></div><p style="margin:8px 0 0;font-size:12px;color:var(--sub)">취업률 = 재직·창업 ÷ (참여자 − 미확인). 한 사람이 같은 사업의 여러 프로그램에 참여하면 1명으로 셉니다.</p></div></section>` : ''}
   <section class="grid2">
-    <div class="panel"><div class="ph"><h2>사업별 참여자 수</h2><small>참여 건수 순 · 상위 10개</small></div>
+    <div class="panel"><div class="ph"><h2>프로그램별 참여자 수</h2><small>참여 건수 순 · 상위 10개</small></div>
       <div class="tw" style="max-height:none"><table class="grid"><thead><tr><th>사업명</th><th>연도</th><th>참여자</th><th>재직·창업</th><th>비율</th></tr></thead><tbody>
       ${s.progs.slice(0,10).map(p => `<tr data-go-program="${p.id}"><td class="name">${E(p.name)}</td><td class="num">${p.year}</td><td class="num">${fmtNum(p.n)}</td><td class="num">${fmtNum(p.emp)}</td><td class="num">${p.n ? Math.round(p.emp/p.n*100) : 0}%</td></tr>`).join('')}
       </tbody></table></div></div>
@@ -1032,11 +1043,14 @@ function statusStack(by, total){
 
 /* ---------- 참여자 통합 DB ---------- */
 function filterBar(f, opts = {}){
-  const progs = store.programs().filter(p => f.year === 'all' || p.year === +f.year);
+  const progsY = store.programs().filter(p => f.year === 'all' || p.year === +f.year);
+  const bizs = [...new Set(progsY.map(bizOf))].sort((a, b) => a.localeCompare(b, 'ko'));
+  const progs = progsY.filter(p => !f.biz || f.biz === 'all' || bizOf(p) === f.biz);
   return `<form class="toolbar" id="${opts.id || 'filters'}" role="search">
     ${opts.noSearch ? '' : `<input class="input search" id="f-q" name="q" placeholder="이름 · 휴대전화 · 이메일 · 관리번호" value="${E(f.q)}" aria-label="검색어">`}
     <select class="select" id="f-year" name="year" aria-label="사업 연도"><option value="all">전체 연도</option>${[2026,2025,2024].map(y => `<option value="${y}" ${+f.year === y ? 'selected' : ''}>${y}년</option>`).join('')}</select>
-    <select class="select" id="f-program" name="program" aria-label="사업명"><option value="all">전체 사업</option>${progs.map(p => `<option value="${p.id}" ${+f.program === p.id ? 'selected' : ''}>${f.year === 'all' ? p.year + ' · ' : ''}${E(p.name)}</option>`).join('')}</select>
+    <select class="select" id="f-biz" name="biz" aria-label="사업명"><option value="all">전체 사업</option>${bizs.map(b => `<option value="${E(b)}" ${f.biz === b ? 'selected' : ''}>${E(b)}</option>`).join('')}</select>
+    <select class="select" id="f-program" name="program" aria-label="프로그램·기수"><option value="all">전체 프로그램·기수</option>${progs.map(p => `<option value="${p.id}" ${+f.program === p.id ? 'selected' : ''}>${f.year === 'all' ? p.year + ' · ' : ''}${E(p.name)}</option>`).join('')}</select>
     ${opts.noStatus ? '' : `<select class="select" id="f-status" name="status" aria-label="현재상태"><option value="all">전체 상태</option>${STATUS_ORDER.map(s => `<option value="${s}" ${f.status === s ? 'selected' : ''}>${STATUS[s]}</option>`).join('')}</select>`}
     ${opts.noJob ? '' : `<select class="select" id="f-job" name="job" aria-label="희망직무·직무"><option value="all">전체 직무</option>${JOBS.map(j => `<option ${f.job === j ? 'selected' : ''}>${j}</option>`).join('')}</select>`}
     ${opts.noDup ? '' : `<select class="select" id="f-dup" name="dup" aria-label="중복 의심"><option value="">중복 여부 전체</option><option value="1" ${f.dup === '1' ? 'selected' : ''}>중복 의심만</option></select>`}
@@ -1146,6 +1160,10 @@ async function accountsView(){
   </tbody></table></div></div>`;
 }
 
+/* ---------- 사후관리 엑셀 양식 (2026-11 확정 · 사업별 사후관리 대시보드양식) ---------- */
+const FORM_H = ['연번','사업년도','사업명','프로그램명','기수','운영 기간','수료일','이름','구직 상태','현재 상태','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','특이사항'];
+const progLabel = (biz, prog, cohort) => [biz, prog, cohort].map(v => String(v ?? '').trim()).filter(Boolean).join(' · ');
+const bizOf = p => p.biz_name || p.name;
 /* ---------- 거주지 자동완성 (시·도 / 시·군·구, 2026년 기준) ---------- */
 const REGIONS = {
   '서울특별시':'종로구 중구 용산구 성동구 광진구 동대문구 중랑구 성북구 강북구 도봉구 노원구 은평구 서대문구 마포구 양천구 강서구 구로구 금천구 영등포구 동작구 관악구 서초구 강남구 송파구 강동구',
@@ -1254,7 +1272,7 @@ function drawer(){
       + FIELDS.map(g => `<fieldset><legend>${g.legend}</legend>${g.items.map(fieldHTML).join('')}</fieldset>`).join('')
       + (statusChanged ? `<div class="f wide"><label for="d-reason">상태 변경 사유 (이력에 남음)</label><input class="input" id="d-reason" data-reason value="${E(st.reason)}" placeholder="예: 10/28 전화 확인, 사후관리 설문 응답"></div>` : '');
   } else if(st.tab === 'enroll'){
-    body = p.enroll.length ? p.enroll.map(e => `<div class="card"><div class="ct"><b>${E(e.program.name)}</b><span class="tag">${e.program.year}년</span></div><dl><dt>운영기간</dt><dd class="num">${fmtD(e.program.start_date)} ~ ${fmtD(e.program.end_date)}</dd><dt>수료일</dt><dd class="num">${fmtD(e.completion_date) || '-'}</dd><dt>참여 당시 유형</dt><dd>${E(e.entry_type || '-')}</dd></dl></div>`).join('') : '<div class="empty">사업 참여 이력이 없습니다.</div>';
+    body = p.enroll.length ? p.enroll.map(e => `<div class="card"><div class="ct"><b>${E(e.program.name)}</b><span class="tag">${e.program.year}년</span></div><dl><dt>사업명</dt><dd>${E(bizOf(e.program))}</dd><dt>프로그램명</dt><dd>${E(e.program.prog_name || '-')}</dd><dt>기수</dt><dd>${E(e.program.cohort || '-')}</dd><dt>운영기간</dt><dd class="num">${fmtD(e.program.start_date)} ~ ${fmtD(e.program.end_date)}</dd><dt>수료일</dt><dd class="num">${fmtD(e.completion_date) || '-'}</dd><dt>참여 당시 유형</dt><dd>${E(e.entry_type || '-')}</dd></dl></div>`).join('') : '<div class="empty">사업 참여 이력이 없습니다.</div>';
     body += `<p style="margin:0;font-size:12px;color:var(--sub)">사업 참여 이력은 엑셀 업로드(STEP 3)로 추가됩니다.</p>`;
   } else if(st.tab === 'emp'){
     body = `<div class="ct" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">새 직장을 등록하면 이전 직장은 종료일과 함께 이력으로 남습니다.</span><button class="btn sm" type="button" data-act="add-emp">취업·창업 등록</button></div>`
@@ -1327,7 +1345,7 @@ function refreshDrawer(keepScroll = true){
    ===================================================================== */
 const UP_FIELDS = [
   ['__skip__','가져오지 않음'],
-  ['program.year','사업 연도'],['program.name','사업명'],['program.period','운영기간'],
+  ['program.year','사업 연도'],['program.name','사업명'],['program.prog','프로그램명'],['program.cohort','기수'],['program.period','운영기간'],
   ['enrollment.completion_date','수료일'],['enrollment.entry_type','참여 당시 유형(구직 상태)'],
   ['name','이름'],['current_status','현재상태'],['birth_date','생년월일'],['age','나이(숫자)'],
   ['nationality','국적'],['residence','거주지'],['phone','휴대전화'],['email','이메일'],
@@ -1338,7 +1356,7 @@ const UP_FIELDS = [
 ];
 const UP_LABEL = Object.fromEntries(UP_FIELDS);
 const hk = h => String(h ?? '').replace(/\s/g,'');
-const DEFAULT_ALIASES = {'사업년도':'program.year','사업연도':'program.year','연도':'program.year','사업명':'program.name','프로그램명':'program.name','운영기간':'program.period','수료일':'enrollment.completion_date','구직상태':'enrollment.entry_type','이름':'name','성명':'name','현재상태':'current_status','취업상태':'current_status','취업정보수신동의':'__skip__','채용정보수신동의':'__skip__','마케팅수신동의':'consent_marketing','나이(년생기입)':'birth_date','생년월일':'birth_date','나이':'age','국적':'nationality','거주지(구)':'residence','거주지':'residence','휴대전화':'phone','휴대폰':'phone','연락처':'phone','전화번호':'phone','이메일':'email','메일':'email','학교명':'school','학교':'school','전공':'major','졸업년도':'graduation_year','졸업연도':'graduation_year','학력':'education','희망직무':'desired_job','취업(창업)일자':'employment.start_date','취업일자':'employment.start_date','입사일':'employment.start_date','회사명':'employment.company','기업명':'employment.company','업종':'employment.industry','직무':'employment.job_title','고용형태':'employment.employment_type','근무지역':'employment.work_region','특이사항':'note','연번':'__skip__','비고':'__skip__','상담내용':'__exclude__','컨설팅진행모습':'__exclude__'};
+const DEFAULT_ALIASES = {'사업년도':'program.year','사업연도':'program.year','연도':'program.year','사업명':'program.name','프로그램명':'program.prog','기수':'program.cohort','차수':'program.cohort','회차':'program.cohort','관리번호':'__skip__','운영기간':'program.period','수료일':'enrollment.completion_date','구직상태':'enrollment.entry_type','이름':'name','성명':'name','현재상태':'current_status','취업상태':'current_status','취업정보수신동의':'__skip__','채용정보수신동의':'__skip__','마케팅수신동의':'consent_marketing','나이(년생기입)':'birth_date','생년월일':'birth_date','나이':'age','국적':'nationality','거주지(구)':'residence','거주지':'residence','휴대전화':'phone','휴대폰':'phone','연락처':'phone','전화번호':'phone','이메일':'email','메일':'email','학교명':'school','학교':'school','전공':'major','졸업년도':'graduation_year','졸업연도':'graduation_year','학력':'education','희망직무':'desired_job','취업(창업)일자':'employment.start_date','취업일자':'employment.start_date','입사일':'employment.start_date','회사명':'employment.company','기업명':'employment.company','업종':'employment.industry','직무':'employment.job_title','고용형태':'employment.employment_type','근무지역':'employment.work_region','특이사항':'note','연번':'__skip__','비고':'__skip__','상담내용':'__exclude__','컨설팅진행모습':'__exclude__'};
 const LOCKED_EXCLUDE = new Set(['상담내용','컨설팅진행모습']);   // 2026-10-28 확정: 저장하지 않음
 const MAX_ROWS = 5000, MAX_MB = 10, CHUNK = 40;
 const up0 = () => ({step:'pick', filename:'', sheets:{}, sheet:'', headerRow:0, mapping:{}, manual:{}, learned:{}, defaults:{year:'', name:'', period:''}, ageBase:todayISO(), overwrite:false, rows:null, filter:'all', page:1, uploadId:null, progress:0, summary:null, err:'', busy:false});
@@ -1394,7 +1412,7 @@ function parseResidence(s){
 }
 const STATUS_MAP = {'구직중':'seeking','구직':'seeking','미취업':'seeking','취업준비':'seeking','취업':'employed','재직':'employed','재직중':'employed','타기업취업':'employed','취업완료':'employed','창업':'startup','창업중':'startup','학생':'education','재학':'education','진학':'education','교육중':'education','진학·교육중':'education','기타':'other','취업계획없음':'other','미확인':'unknown'};
 function parseStatus(v){ const s = hk(v); if(!s) return {v:'unknown'}; if(STATUS_MAP[s]) return {v:STATUS_MAP[s]}; return {v:'other', warn:`현재상태 '${v}'는 정해진 값이 아니어서 '기타'로 넣습니다`}; }
-function parseConsent(v){ const s = hk(v).toLowerCase(); if(!s) return {v:null}; if(['동의','y','yes','o','예','true','1'].includes(s)) return {v:true}; if(['미동의','비동의','n','no','x','아니오','거부','false','0'].includes(s)) return {v:false}; return {v:null, warn:`수신 동의 값 '${v}'를 읽지 못해 비워 둡니다`}; }
+function parseConsent(v){ const s = hk(v).toLowerCase(); if(!s) return {v:null}; if(s.includes('청년나이')) return {v:null, info:'청년 나이가 아니어서 마케팅 수신 동의를 받지 않은 대상입니다(비워 둠)'}; if(['동의','y','yes','o','예','true','1'].includes(s)) return {v:true}; if(['미동의','비동의','n','no','x','아니오','거부','false','0'].includes(s)) return {v:false}; return {v:null, warn:`수신 동의 값 '${v}'를 읽지 못해 비워 둡니다`}; }
 const sv = v => v == null ? '' : v instanceof Date ? isoOf(v) : String(v).trim();
 
 function normRow(raw, u){
@@ -1404,7 +1422,10 @@ function normRow(raw, u){
   const yv = sv(g('program.year')) || u.defaults.year;
   const ym = String(yv).match(/^(\d{4}|\d{2})\s*년?$/);
   if(!yv) errors.push('사업 연도가 없습니다'); else if(!ym) errors.push(`사업 연도 '${yv}'를 읽을 수 없습니다`); else n.program.year = ym[1].length === 2 ? 2000 + +ym[1] : +ym[1];
-  n.program.name = sv(g('program.name')) || u.defaults.name.trim(); if(!n.program.name) errors.push('사업명이 없습니다');
+  n.program.biz = sv(g('program.name')) || u.defaults.name.trim(); if(!n.program.biz) errors.push('사업명이 없습니다');
+  n.program.prog = sv(g('program.prog')) || ''; n.program.cohort = sv(g('program.cohort')) || '';
+  if(/^\d+$/.test(n.program.cohort)) n.program.cohort += '기';
+  n.program.name = progLabel(n.program.biz, n.program.prog, n.program.cohort);
   const pv = sv(g('program.period')) ? g('program.period') : u.defaults.period;
   if(sv(pv)){ const p = parsePeriod(pv); if(p.err) warnings.push(`운영기간 '${sv(pv)}'를 읽지 못해 비워 둡니다`); else { n.program.start = p.start; n.program.end = p.end; if(p.warn) warnings.push(p.warn); } }
   const cd = g('enrollment.completion_date'); if(sv(cd)){ const d = parseDate(cd); if(d.err) warnings.push(`수료일 '${sv(cd)}'를 읽지 못해 비워 둡니다`); else n.enrollment.completion_date = d.v; }
@@ -1426,7 +1447,7 @@ function normRow(raw, u){
   ['school','major','education','desired_job'].forEach(k => n[k] = sv(g(k)) || null);
   const gy = sv(g('graduation_year')); if(gy){ const m = gy.match(/^(\d{4}|\d{2})/); if(m) n.graduation_year = m[1].length === 2 ? (+m[1] <= curYY() ? 2000 : 1900) + +m[1] : +m[1]; else warnings.push(`졸업 연도 '${gy}'를 읽지 못했습니다`); }
   let note = sv(g('note')); if(note.length > 500){ warnings.push('특이사항이 500자를 넘어 뒷부분을 잘랐습니다'); note = note.slice(0,500); } n.note = note || null;
-  ['consent_marketing'].forEach(k => { const c = parseConsent(g(k)); n[k] = c.v; if(c.warn) warnings.push(c.warn); });
+  ['consent_marketing'].forEach(k => { const c = parseConsent(g(k)); n[k] = c.v; if(c.warn) warnings.push(c.warn); if(c.info) info.push(c.info); });
   // 취업·창업
   const company = sv(g('employment.company')), sd = g('employment.start_date');
   if(company || sv(sd)){
@@ -1460,7 +1481,8 @@ async function readWorkbook(file){
   wb.SheetNames.forEach((n, idx) => { const ws = wb.Sheets[n]; if(!ws['!ref']) return; const off = XLSX.utils.decode_range(ws['!ref']).s.r; const hidden = !!(wb.Workbook && wb.Workbook.Sheets && wb.Workbook.Sheets[idx] && wb.Workbook.Sheets[idx].Hidden); sheets[n] = {aoa: XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:true}), offset: off, hidden}; });
   return sheets;
 }
-function aliasFor(h){ const k = hk(h); if(!k) return null; if(LOCKED_EXCLUDE.has(k)) return '__exclude__'; const a = st.up.learned[k] || DEFAULT_ALIASES[k] || null; return a && !UP_LABEL[a] ? '__skip__' : a; }
+function aliasFor(h){ const k = hk(h); if(!k) return null; if(LOCKED_EXCLUDE.has(k)) return '__exclude__'; const a = (FORM_KEYS.has(k) ? DEFAULT_ALIASES[k] : null) || st.up.learned[k] || DEFAULT_ALIASES[k] || null; return a && !UP_LABEL[a] ? '__skip__' : a; }
+const FORM_KEYS = new Set(FORM_H.map(h => String(h).replace(/\s/g,'')));
 function detectHeader(aoa){ for(let i = 0; i < Math.min(15, aoa.length); i++){ if((aoa[i] || []).filter(c => aliasFor(c)).length >= 3) return i; } const f = aoa.findIndex(nonEmpty); return f < 0 ? 0 : f; }
 function sheetStats(name){ const s = st.up.sheets[name]; const h = detectHeader(s.aoa); const pc = personCols(s.aoa[h]); return {h, data: s.aoa.slice(h + 1).filter(r => nonEmpty(r) && hasPerson(r, pc)).length, blank: s.aoa.slice(h + 1).filter(r => nonEmpty(r) && !hasPerson(r, pc)).length}; }
 function setSheet(name){ const u = st.up; u.sheet = name; u.headerRow = detectHeader(u.sheets[name].aoa); buildMapping(); }
@@ -1586,10 +1608,12 @@ function sampleSheets(kind){
   let ph = kind === 'std' ? 5001 : 6001; const phone = (fmt) => { const d = String(ph++); return fmt === 0 ? `010-0000-${d}` : fmt === 1 ? `0100000${d}` : fmt === 2 ? `010 0000 ${d}` : Number(`100000${d}`); };
   const birth = () => { const y = 1993 + Math.floor(R() * 11), m = 1 + Math.floor(R() * 12), d = 1 + Math.floor(R() * 28); const f = Math.floor(R() * 4); return f === 0 ? `${y}.${pad(m)}.${pad(d)}` : f === 1 ? `${String(y).slice(2)}-${pad(m)}-${pad(d)}` : f === 2 ? `${y}${pad(m)}${pad(d)}` : `${String(y).slice(2)}${pad(m)}${pad(d)}`; };
   if(kind === 'std'){
-    const H = ['연번','사업년도','사업명','운영 기간','이름','현재 상태','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','특이사항'];
+    const H0 = ['연번','사업년도','사업명','운영 기간','이름','현재 상태','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','특이사항'];
+    const H = FORM_H;
     const progs = [['관악_면접리허설','2026.04.21-2026.04.30'],['관악_신입가이드','2026.09.01~2026.09.12'],['26년 서울형 청년인턴 직무캠프','2026.07.06~2026.08.14']];
+    const PARTS = {'관악_면접리허설':['[가상] 관악 청년 취업지원','면접리허설','1기'], '관악_신입가이드':['[가상] 관악 청년 취업지원','신입가이드','2기'], '26년 서울형 청년인턴 직무캠프':['[가상] 서울형 청년인턴','직무캠프','']};
     const rows = []; let no = 1;
-    const row = o => rows.push(H.map(h => o[h] ?? null));
+    const row = o => { const pp = PARTS[o['사업명']]; if(pp) Object.assign(o, {'사업명':pp[0], '프로그램명':pp[1], '기수':pp[2]}); if(o['마케팅 수신 동의'] === undefined && R() < .1) o['마케팅 수신 동의'] = '청년나이 X'; rows.push(H.map(h => o[h] ?? null)); };
     for(let i = 0; i < 34; i++){
       const [pn, per] = pick(progs); const st0 = pick(['','','','구직중','취업','타기업 취업','학생','취업계획없음','창업']);
       const o = {'연번':no++, '사업년도':2026, '사업명':pn, '운영 기간':per, '이름':nm(), '현재 상태':st0, '마케팅 수신 동의':pick(['동의','미동의','']), '나이(년생기입)':birth(), '거주지(구)':pick(['서울시 관악구','서울 동작구','경기도 성남시','미파악','']), '휴대전화':phone(i % 4), '이메일':R() < .5 ? `sample${ph}@example.com` : '', '학교명':pick(['한빛대학교','누리대학교','']), '전공':pick(['경영학','통계학','']), '졸업년도':pick([2024,2025,'26','']), '희망직무':pick(JOBS)};
@@ -1646,6 +1670,7 @@ function pickView(){
       <span class="btn" aria-hidden="true">파일 선택</span>
     </label>
     ${st.up.err ? `<div class="issues" style="margin-top:12px">${E(st.up.err)}</div>` : ''}
+    <div class="toolbar" style="margin-top:12px;justify-content:center"><span style="font-size:12.5px;color:var(--sub)">사후관리 엑셀 양식(사업명 · 프로그램명 · 기수 포함 28개 항목)에 맞춰 올리면 열이 자동으로 연결됩니다.</span><button class="btn ghost sm" type="button" data-up="template">빈 양식 내려받기</button></div>
     ${DEMO || CFG.ENV_LABEL ? `<div style="margin-top:14px;display:flex;flex-direction:column;gap:8px;align-items:center"><span style="font-size:12.5px;color:var(--sub)">${DEMO ? '실제 명단 대신 가상 예시 파일로 체험해 보세요' : '테스트 환경 전용 · 가상 예시 파일로 업로드를 시험합니다(실제 DB에 저장됨)'}</span><div class="samples"><button class="btn ghost sm" type="button" data-up="sample-std">표준 양식 예시 (2026년 시트, 50행)</button><button class="btn ghost sm" type="button" data-up="sample-gw">관악드림온형 예시 (32열, 2행 머리글)</button></div></div>` : ''}
   </div>`;
 }
@@ -1818,8 +1843,9 @@ document.addEventListener('click', async ev => {
     if(a === 'commit-go') return commitUpload();
     if(a === 'export-check') return exportUploadRows(u.rows, '업로드검사');
     if(a === 'export-result') return exportUploadRows(u.rows, `업로드${u.uploadId}_결과`);
-    if(a === 'go-people'){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all', dup:''}; st.sort = 'updated_at'; st.dir = 'desc'; st.page = 1; return setView('people'); }
+    if(a === 'go-people'){ st.f = {q:'', year:'all', biz:'all', program:'all', status:'all', job:'all', dup:''}; st.sort = 'updated_at'; st.dir = 'desc'; st.page = 1; return setView('people'); }
     if(a === 'backup') return downloadBackup();
+    if(a === 'template') return downloadTemplate();
     if(a === 'revert-go'){ const id = +el.dataset.id; closeModal(); try{ await store.revertUpload(id); if(st.up.uploadId === id) st.up = up0(); toast(`업로드 #${id}을 되돌렸습니다.`); }catch(e){ toast(e.message); } return renderMain(); }
     return;
   }
@@ -1902,7 +1928,9 @@ function personModal(){
     <div class="f"><label for="np-gu">거주지 구·시·군</label><input class="input" id="np-gu" name="residence_gu" list="np-dl-gu" autocomplete="off" data-region="np" data-part="gu" placeholder="관악 → 관악구">${regionLists('np', '')}</div>
     <div class="f"><label for="np-job">희망직무</label><select class="select" id="np-job" name="desired_job"><option value="">선택 안 함</option>${JOBS.map(j => `<option>${j}</option>`).join('')}</select></div>
     <div class="f"><label for="np-year">사업 연도</label><input class="input" id="np-year" name="year" value="${new Date().getFullYear()}" inputmode="numeric"></div>
-    <div class="f"><label for="np-program">사업명</label><input class="input" id="np-program" name="program" list="np-programs" placeholder="목록에서 고르거나 새로 입력"><datalist id="np-programs">${[...new Set(progs.map(p => p.name))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
+    <div class="f"><label for="np-program">사업명</label><input class="input" id="np-program" name="program" list="np-programs" placeholder="목록에서 고르거나 새로 입력"><datalist id="np-programs">${[...new Set(progs.map(bizOf))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
+    <div class="f"><label for="np-prog">프로그램명</label><input class="input" id="np-prog" name="prog" list="np-progs" placeholder="선택 입력"><datalist id="np-progs">${[...new Set(progs.map(p => p.prog_name).filter(Boolean))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
+    <div class="f"><label for="np-cohort">기수</label><input class="input" id="np-cohort" name="cohort" placeholder="예: 1기 (선택 입력)"></div>
   </fieldset><div id="np-err" style="margin-top:10px"></div>
   <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">등록</button></div></form>`);
 }
@@ -1915,7 +1943,8 @@ async function submitPerson(fd){
   if(g('program') && !/^\d{4}$/.test(g('year'))) return err('사업 연도를 네 자리로 입력하세요.');
   const data = {name:g('name'), current_status:g('current_status') || 'unknown', phone, email, birth_date:birth, desired_job:g('desired_job') || null, residence_sido:normSido(g('residence_sido')) || null, residence_gu:g('residence_gu') || null};
   try{
-    const p = await store.create(data, g('program') ? {year:+g('year'), name:g('program')} : null);
+    const coh = /^\d+$/.test(g('cohort')) ? g('cohort') + '기' : g('cohort');
+    const p = await store.create(data, g('program') ? {year:+g('year'), name:progLabel(g('program'), g('prog'), coh), biz:g('program'), prog:g('prog'), cohort:coh} : null);
     closeModal(); toast(`${p.name}님을 ${p.code}로 등록했습니다.${p.dup && p.dup.length ? ` 중복 의심 ${p.dup.length}건이 있습니다.` : ''}`);
     st.detail = p; st.draft = draftFrom(p); st.errs = {}; st.tab = 'info'; await renderMain(); refreshDrawer(false);
   }catch(e){ err(e.message); }
@@ -1960,20 +1989,36 @@ async function saveInner(){
   st.draft = draftFrom(st.detail); st.reason = ''; refreshDrawer(); toast(`저장했습니다. 변경 항목 ${Object.keys(patch).length}개가 이력에 남았습니다.`);
   renderMain();
 }
+function formRows(rows){
+  const out = []; let no = 1;
+  rows.forEach(r => {
+    const base = {'이름':r.name, '현재 상태':STATUS[r.current_status], '마케팅 수신 동의':r.consent_marketing == null ? '' : r.consent_marketing ? '동의' : '미동의',
+      '나이(년생기입)':r.birth_date ? birthToYY(r.birth_date) : (r.birth_year || ''), '국적':r.nationality || '', '거주지(구)':[r.residence_sido, r.residence_gu].filter(Boolean).join(' '),
+      '휴대전화':r.phone || '', '이메일':r.email || '', '학교명':r.school || '', '전공':r.major || '', '졸업년도':r.graduation_year || '', '학력':r.education || '', '희망직무':r.desired_job || '',
+      '취업(창업)일자':r.emp?.start_date ? fmtD(r.emp.start_date) : '', '회사명':r.emp?.company || '', '업종':r.emp?.industry || '', '직무':r.emp?.job_title || '', '고용형태':r.emp?.employment_type || '', '근무지역':r.emp?.work_region || '',
+      '특이사항':'', '관리번호':r.code};
+    const ens = r.enroll && r.enroll.length ? r.enroll : [null];
+    ens.forEach(e => out.push({...base, '연번':no++, '사업년도':e ? e.program.year : '', '사업명':e ? bizOf(e.program) : '', '프로그램명':e?.program.prog_name || '', '기수':e?.program.cohort || '',
+      '운영 기간':e && e.program.start_date ? `${fmtD(e.program.start_date)}~${fmtD(e.program.end_date)}` : '', '수료일':e?.completion_date ? fmtD(e.completion_date) : '', '구직 상태':e?.entry_type || ''}));
+  });
+  return out;
+}
+function writeForm(data, sheet, fn){
+  const H = [...FORM_H, '관리번호'];
+  const ws = XLSX.utils.json_to_sheet(data, {header:H}); ws['!cols'] = H.map(k => ({wch: Math.max(8, String(k).length * 2 + 2)}));
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, sheet);
+  XLSX.writeFile(wb, fn);
+}
 async function exportXlsx(f, name){
   if(!window.XLSX){ toast('엑셀 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.'); return; }
-  const rows = await store.exportRows(f);
-  const data = rows.map(r => ({
-    '관리번호':r.code, '사업 연도':r.latest?.year ?? '', '사업명':r.enroll.map(e => e.program.name).join(' / '), '운영기간': r.latest ? `${fmtD(r.latest.start_date)}~${fmtD(r.latest.end_date)}` : '',
-    '이름':r.name, '현재상태':STATUS[r.current_status], '생년월일':birthToYY(r.birth_date), '나이(오늘 기준)':r.birth_date ? age(r.birth_date) : '', '국적':r.nationality||'', '거주지':[r.residence_sido,r.residence_gu].filter(Boolean).join(' '),
-    '휴대전화':r.phone||'', '이메일':r.email||'', '학교명':r.school||'', '전공':r.major||'', '졸업 연도':r.graduation_year||'', '학력':r.education||'', '희망직무':r.desired_job||'',
-    '취업(창업)일자':r.emp?.start_date||'', '회사명':r.emp?.company||'', '업종':r.emp?.industry||'', '직무':r.emp?.job_title||'', '고용형태':r.emp?.employment_type||'', '근무지역':r.emp?.work_region||'',
-    '최초 등록일':fmtD(r.created_at), '최종 수정일':fmtDT(r.updated_at), '수정 담당자':r.updated_by_name
-  }));
-  const ws = XLSX.utils.json_to_sheet(data); ws['!cols'] = Object.keys(data[0] || {}).map(k => ({wch: Math.max(8, k.length * 2)}));
-  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '참여자');
+  const rows = await store.exportRows(f); const data = formRows(rows);
   const fn = `커리어링크_${name}_${todayISO().replace(/-/g,'')}_${st.user.name}.xlsx`;
-  try{ XLSX.writeFile(wb, fn); toast(`${fmtNum(rows.length)}명을 ${fn}로 내려받았습니다. 특이사항은 보안상 제외됩니다.`); }
+  try{ writeForm(data, '통합', fn); toast(`${fmtNum(rows.length)}명(사업 참여 ${fmtNum(data.length)}행)을 사후관리 양식으로 내려받았습니다. 특이사항은 보안상 비워 둡니다.`); }
+  catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다. 실제 배포 주소에서 다시 시도해 주세요.'); }
+}
+function downloadTemplate(){
+  if(!window.XLSX){ toast('엑셀 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.'); return; }
+  try{ const ws = XLSX.utils.aoa_to_sheet([FORM_H]); ws['!cols'] = FORM_H.map(k => ({wch: Math.max(8, String(k).length * 2 + 2)})); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '통합'); XLSX.writeFile(wb, '사후관리_양식_빈파일.xlsx'); }
   catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다. 실제 배포 주소에서 다시 시도해 주세요.'); }
 }
 function setView(v){
@@ -1988,9 +2033,10 @@ document.addEventListener('click', async ev => {
   const q = sel => t.closest(sel);
   let el;
   if((el = q('[data-view]'))) return setView(el.dataset.view);
-  if((el = q('[data-go-people]'))){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
-  if((el = q('[data-go-emp]'))){ st.ef = {status:el.dataset.goEmp, year:'all', program:'all'}; st.epage = 1; return setView('employment'); }
-  if((el = q('[data-go-program]'))){ const p = store.programs().find(x => x.id === +el.dataset.goProgram); st.f = {q:'', year:String(p.year), program:String(p.id), status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
+  if((el = q('[data-go-people]'))){ st.f = {q:'', year:'all', biz:'all', program:'all', status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
+  if((el = q('[data-go-emp]'))){ st.ef = {status:el.dataset.goEmp, year:'all', biz:'all', program:'all'}; st.epage = 1; return setView('employment'); }
+  if((el = q('[data-go-biz]'))){ const i = el.dataset.goBiz.indexOf('|'); st.f = {q:'', year:el.dataset.goBiz.slice(0, i), biz:el.dataset.goBiz.slice(i + 1), program:'all', status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
+  if((el = q('[data-go-program]'))){ const p = store.programs().find(x => x.id === +el.dataset.goProgram); st.f = {q:'', year:String(p.year), biz:bizOf(p), program:String(p.id), status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
   if((el = q('[data-open]'))){ ev.preventDefault(); return openDetail(+el.dataset.open); }
   if((el = q('[data-restore]'))){ const [k, i] = el.dataset.restore.split(':'); return restoreModal(k, +i); }
   if((el = q('[data-hsrc]'))){ st.histSrc = el.dataset.hsrc; return refreshDrawer(); }
@@ -2012,7 +2058,7 @@ document.addEventListener('click', async ev => {
     if(a === 'pw') return pwModal();
     if(a === 'modal-close') return closeModal();
     if(a === 'discard'){ closeModal(); st.draft = draftFrom(st.detail); const n = confirmClose.next; confirmClose.next = null; return n && n(); }
-    if(a === 'reset'){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all', dup:''}; st.page = 1; return renderMain(); }
+    if(a === 'reset'){ st.f = {q:'', year:'all', biz:'all', program:'all', status:'all', job:'all', dup:''}; st.page = 1; return renderMain(); }
     if(a === 'cols'){ st.colOpen = !st.colOpen; return renderMain(); }
     if(a === 'cols-default'){ st.cols = DEFAULT_COLS.slice(); store_ls.set('cl.cols', st.cols); return renderMain(); }
     if(a === 'cols-all'){ st.cols = COLS.map(c => c.key); store_ls.set('cl.cols', st.cols); return renderMain(); }
@@ -2033,9 +2079,9 @@ document.addEventListener('change', ev => {
   const t = ev.target;
   if(t.dataset.col){ const k = t.dataset.col; st.cols = t.checked ? COLS.map(c => c.key).filter(x => x === k || st.cols.includes(x)) : st.cols.filter(x => x !== k); store_ls.set('cl.cols', st.cols); return renderMain(); }
   const form = t.closest('form');
-  if(form?.id === 'filters' && t.tagName === 'SELECT'){ st.f[t.name] = t.value; if(t.name === 'year') st.f.program = 'all'; st.page = 1; return renderMain(); }
+  if(form?.id === 'filters' && t.tagName === 'SELECT'){ st.f[t.name] = t.value; if(t.name === 'year'){ st.f.program = 'all'; st.f.biz = 'all'; } if(t.name === 'biz') st.f.program = 'all'; st.page = 1; return renderMain(); }
   if(form?.id === 'dupfilters' && t.tagName === 'SELECT'){ st.dupf[t.name] = t.value; st.dpage = 1; return renderMain(); }
-  if(form?.id === 'efilters'){ st.ef[t.name] = t.value; if(t.name === 'year') st.ef.program = 'all'; st.epage = 1; return renderMain(); }
+  if(form?.id === 'efilters'){ st.ef[t.name] = t.value; if(t.name === 'year'){ st.ef.program = 'all'; st.ef.biz = 'all'; } if(t.name === 'biz') st.ef.program = 'all'; st.epage = 1; return renderMain(); }
   if(t.dataset.d && t.tagName === 'SELECT'){ st.draft[t.dataset.d] = t.value; delete st.errs[t.dataset.d]; refreshDrawer(); }
 });
 document.addEventListener('input', ev => {
