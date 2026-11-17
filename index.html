@@ -288,6 +288,8 @@ table.prev select{padding:4px 6px;font-size:12px}
 .dup dt{color:var(--sub)}
 .dup dd{margin:0;min-width:0;overflow-wrap:anywhere}
 .dup dd.diff{color:var(--warn);font-weight:600}
+.dup .dsum{padding:8px 16px;font-size:12.5px;border-bottom:1px solid var(--line);line-height:1.6}
+.dup .hl{font-weight:700;color:var(--bad)}
 .dup .acts{display:flex;gap:8px;flex-wrap:wrap}
 
 @media (max-width:1100px){.opts{grid-template-columns:1fr}.result{grid-template-columns:repeat(3,minmax(0,1fr))}}
@@ -477,12 +479,14 @@ function makeDemoStore(){
   function view(p){
     const en = enrOf(p.id).sort((a,b) => (b.program.year - a.program.year) || b.program.start_date.localeCompare(a.program.start_date));
     const emp = curEmp(p.id);
-    return {...p, enroll: en, latest: en[0]?.program || null, emp, updated_by_name: adminName(p.updated_by)};
+    const dup_n = db.duplicates.filter(d => d.status === 'pending' && (d.participant_a === p.id || d.participant_b === p.id)).length;
+    return {...p, enroll: en, latest: en[0]?.program || null, emp, dup_n, updated_by_name: adminName(p.updated_by)};
   }
   function filtered(f){
     const q = (f.q||'').trim().toLowerCase(); const qd = q.replace(/\D/g,'');
     return active().filter(p => {
       if(f.status && f.status !== 'all' && p.current_status !== f.status) return false;
+      if(f.dup === '1' && !db.duplicates.some(d => d.status === 'pending' && (d.participant_a === p.id || d.participant_b === p.id))) return false;
       if(f.job && f.job !== 'all'){ const e = curEmp(p.id); if(p.desired_job !== f.job && e?.job_title !== f.job) return false; }
       if((f.year && f.year !== 'all') || (f.program && f.program !== 'all')){
         const en = enrOf(p.id);
@@ -677,9 +681,26 @@ function makeDemoStore(){
     },
     samplePeople(n){ return active().filter(p => p.birth_date).slice(30, 30 + n).map(p => ({name:p.name, phone:p.phone, email:p.email, birth_date:p.birth_date})); },
     /* --- 중복 확인 · 통합 --- */
-    async duplicates(){
-      return db.duplicates.filter(d => d.status === 'pending' && byId.get(d.participant_a) && byId.get(d.participant_b))
-        .map(d => ({...d, a:{...view(byId.get(d.participant_a)), emps:db.employments.filter(e => e.participant_id === d.participant_a)}, b:{...view(byId.get(d.participant_b)), emps:db.employments.filter(e => e.participant_id === d.participant_b)}}));
+    async duplicates(f = {}, page = 1, size = 20){
+      const live = p => p && !p.merged_into_id;
+      const base = db.duplicates.filter(d => d.status === 'pending' && live(byId.get(d.participant_a)) && live(byId.get(d.participant_b))).map(d => {
+        const pa = new Set(enrOf(d.participant_a).map(e => e.program_id)); const shared = enrOf(d.participant_b).filter(e => pa.has(e.program_id)).map(e => ({id:e.program_id, year:e.program.year, name:e.program.name}));
+        return {...d, shared};
+      }).filter(d => {
+        const q = (f.q || '').trim(); const A = byId.get(d.participant_a), B = byId.get(d.participant_b);
+        if(q && ![A.name, B.name, A.code, B.code].some(x => x.includes(q))) return false;
+        if(f.program && f.program !== 'all' && ![d.participant_a, d.participant_b].some(id => enrOf(id).some(e => e.program_id === +f.program))) return false;
+        return true;
+      });
+      const by_reason = {}; base.forEach(d => by_reason[d.reason] = (by_reason[d.reason] || 0) + 1);
+      const filt = base.filter(d => (!f.reason || f.reason === 'all' || d.reason === f.reason) && (!f.shared || d.shared.length)).sort((x, y) => y.score - x.score || x.id - y.id);
+      const rows = filt.slice((page - 1) * size, page * size).map(d => ({...d, a:{...view(byId.get(d.participant_a)), emps:db.employments.filter(e => e.participant_id === d.participant_a)}, b:{...view(byId.get(d.participant_b)), emps:db.employments.filter(e => e.participant_id === d.participant_b)}}));
+      return {total:filt.length, by_reason, shared_n:base.filter(d => d.shared.length).length, rows};
+    },
+    async restoreChange(kind, ref, reason){
+      if(kind === 'field'){ const c = db.change_log.find(x => x.id === ref); const p = byId.get(c.entity_id); await this.update(p.id, {[c.field]: c.old_value}, reason || '변경 이력에서 복구'); db.change_log[db.change_log.length - 1].source = 'restore'; return this.get(p.id); }
+      const h = db.status_history.find(x => x.id === ref); if(!h.from_status) throw Error('최초 등록 기록이라 이전 상태가 없습니다.');
+      await this.update(h.participant_id, {current_status:h.from_status}, reason || '변경 이력에서 복구'); db.status_history[db.status_history.length - 1].source = 'restore'; return this.get(h.participant_id);
     },
     async merge(dupId, keepId){
       if(me.role !== 'owner') throw Error('통합은 최고관리자만 할 수 있습니다.');
@@ -812,10 +833,11 @@ function makeSupabaseStore(cfg){
     },
     async revertUpload(id){ await rpc('upload_revert', {upload_id:id}); await refreshCaches(); return true; },
     /* 중복 · 통합 */
-    async duplicates(){ return rpc('list_duplicates'); },
+    async duplicates(f = {}, page = 1, size = 20){ return rpc('list_duplicates', {f, page, size}); },
+    async restoreChange(kind, ref, reason){ return rpc('restore_change', {kind, ref, reason: reason || null}); },
     async merge(dupId, keepId){ const r = await rpc('merge_participants', {dup_id:dupId, keep_id:keepId}); await refreshCaches(); return r; },
     async dismissDuplicate(dupId){ await rpc('dismiss_duplicate', {dup_id:dupId}); },
-    async dupCount(){ const r = await q(sb.from('duplicate_candidates').select('id', {count:'exact', head:true}).eq('status', 'pending')); return r?.count || 0; },
+    async dupCount(){ try{ return await rpc('dup_count'); }catch{ const r = await q(sb.from('duplicate_candidates').select('id', {count:'exact', head:true}).eq('status', 'pending')); return r?.count || 0; } },
     /* 백업 · 운영 */
     async backup(){
       if(me?.role !== 'owner') throw Error('전체 백업은 최고관리자만 내려받을 수 있습니다.');
@@ -837,7 +859,7 @@ try{ store = DEMO ? makeDemoStore() : makeSupabaseStore(CFG); }catch(e){ STORE_E
    ===================================================================== */
 const COLS = [
   {key:'code', label:'관리번호', cls:'code', get:r => r.code, sortv:r => r.code},
-  {key:'name', label:'이름', cls:'name', get:r => E(r.name), sortv:r => r.name},
+  {key:'name', label:'이름', cls:'name', get:r => E(r.name) + (r.dup_n ? ` <span class="badge b-dup" title="중복 의심 ${r.dup_n}건">중복 의심</span>` : ''), sortv:r => r.name},
   {key:'status', label:'현재상태', get:r => chip(r.current_status), sortv:r => STATUS_ORDER.indexOf(r.current_status)},
   {key:'birth', label:'생년월일(나이)', get:r => r.birth_date ? `<span class="num">${birthToYY(r.birth_date)}</span> <span class="dim">(${age(r.birth_date)}세)</span>` : '', sortv:r => r.birth_date},
   {key:'phone', label:'휴대전화', get:r => `<span class="num">${maskPhone(r.phone)}</span>`, sortv:r => r.phone},
@@ -872,10 +894,10 @@ const EMP_COLS = ['code','name','status','program','emp_start','company','indust
 const VIEWS = ['dashboard','people','employment','upload','duplicates','backup','logs','accounts'];
 const st = {
   user:null, view:'dashboard', loginErr:'', busy:false,
-  f:{q:'', year:'all', program:'all', status:'all', job:'all'}, sort:'updated_at', dir:'desc', page:1, size:50,
+  f:{q:'', year:'all', program:'all', status:'all', job:'all', dup:''}, sort:'updated_at', dir:'desc', page:1, size:50,
   ef:{status:'unknown', year:'all'}, epage:1,
   cols: store_ls.get('cl.cols') || DEFAULT_COLS, colOpen:false,
-  detail:null, tab:'info', draft:null, errs:{}, reason:'',
+  detail:null, tab:'info', draft:null, errs:{}, reason:'', histSrc:'all',
   lastAct: Date.now(), warned:false,
 };
 
@@ -938,6 +960,7 @@ function sidebar(){
 async function renderMain(){
   const m = $('#main'); if(!m) return;
   const v = st.view;
+  try{
   if(v === 'dashboard') m.innerHTML = await dashboardView();
   else if(v === 'people') m.innerHTML = await peopleView();
   else if(v === 'employment') m.innerHTML = await employmentView();
@@ -946,7 +969,8 @@ async function renderMain(){
   else if(v === 'backup') m.innerHTML = await backupView();
   else if(v === 'logs') m.innerHTML = await logsView();
   else if(v === 'accounts') m.innerHTML = await accountsView();
-  const dc = await store.dupCount();
+  }catch(e){ console.error(e); m.innerHTML = `<div class="head"><div><h1>화면을 불러오지 못했습니다</h1><p>${E(e.message || String(e))}</p></div></div><div class="panel"><p style="margin:0 0 12px;font-size:13px;color:var(--sub)">잠시 뒤 다시 시도해 주세요. 같은 문제가 계속되면 이 메시지를 캡처해 공유해 주세요.</p><button class="btn" type="button" data-act="retry">다시 시도</button></div>`; }
+  let dc = st.dupCount; try{ dc = await store.dupCount(); }catch{}
   if(dc !== st.dupCount){ st.dupCount = dc; const s = document.querySelector('.side'); if(s) s.outerHTML = sidebar(); }
   updateIdle();
 }
@@ -1007,6 +1031,7 @@ function filterBar(f, opts = {}){
     <select class="select" id="f-program" name="program" aria-label="사업명"><option value="all">전체 사업</option>${progs.map(p => `<option value="${p.id}" ${+f.program === p.id ? 'selected' : ''}>${f.year === 'all' ? p.year + ' · ' : ''}${E(p.name)}</option>`).join('')}</select>
     ${opts.noStatus ? '' : `<select class="select" id="f-status" name="status" aria-label="현재상태"><option value="all">전체 상태</option>${STATUS_ORDER.map(s => `<option value="${s}" ${f.status === s ? 'selected' : ''}>${STATUS[s]}</option>`).join('')}</select>`}
     ${opts.noJob ? '' : `<select class="select" id="f-job" name="job" aria-label="희망직무·직무"><option value="all">전체 직무</option>${JOBS.map(j => `<option ${f.job === j ? 'selected' : ''}>${j}</option>`).join('')}</select>`}
+    ${opts.noDup ? '' : `<select class="select" id="f-dup" name="dup" aria-label="중복 의심"><option value="">중복 여부 전체</option><option value="1" ${f.dup === '1' ? 'selected' : ''}>중복 의심만</option></select>`}
     ${opts.noSearch ? '' : `<button class="btn" type="submit">검색</button><button class="btn ghost" type="button" data-act="reset">초기화</button>`}
   </form>`;
 }
@@ -1048,7 +1073,7 @@ async function employmentView(){
     <button class="btn ghost" type="button" data-act="export-emp" ${total ? '' : 'disabled'}>이 목록 엑셀 다운로드</button></div>
   <div class="panel">
     <div class="segs" role="tablist">${['unknown','seeking','employed','startup','education','other','all'].map(s => `<button type="button" role="tab" class="seg ${st.ef.status === s ? 'on' : ''}" data-est="${s}" aria-selected="${st.ef.status === s}">${s === 'all' ? '전체' : STATUS[s]} <b>${fmtNum(c[s])}</b></button>`).join('')}</div>
-    <div style="margin-top:12px">${filterBar(st.ef, {id:'efilters', noSearch:true, noStatus:true, noJob:true})}</div>
+    <div style="margin-top:12px">${filterBar(st.ef, {id:'efilters', noSearch:true, noStatus:true, noJob:true, noDup:true})}</div>
     ${st.ef.status === 'unknown' ? `<div class="warnbox" style="margin-top:12px">미확인 ${fmtNum(c.unknown)}명은 기존 엑셀에 상태 값이 없던 참여자입니다. 연락 후 상태를 바꾸면 '변경 이력'에 사유와 담당자가 남습니다.</div>` : ''}
     <div class="tablebar"><span class="count"><b>${fmtNum(total)}</b>명</span></div>
     ${tableHTML(rows, EMP_COLS, 'updated_at', 'desc', st.detail?.id)}
@@ -1067,7 +1092,7 @@ async function dupView_old(){
   return `<div class="head"><div><h1>중복 확인</h1><p>STEP 3에서 통합 기능을 구현합니다. 현재 가상 데이터에 이름·생년월일이 같은 의심 쌍이 ${s.dups}건 있습니다.</p></div></div>
   <div class="panel"><p style="margin:0;color:var(--sub);font-size:13px;line-height:1.7">판단 기준: 휴대전화 일치(100점) → 이메일 일치(90점) → 이름+생년월일 일치(70점) → 이름만 일치(30점, 참고). 자동 통합은 하지 않고, 관리자가 확인한 뒤 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고 다른 쪽은 '통합됨'으로 보존합니다. 참여자 상세 화면의 기본 정보 탭 상단에서도 의심 대상을 확인할 수 있습니다.</p></div>`;
 }
-const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경'};
+const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구'};
 async function logsView(){
   const l = await store.auditLog();
   return `<div class="head"><div><h1>작업 기록</h1><p>로그인, 상세 조회, 수정, 다운로드가 자동으로 남습니다. 기록은 수정하거나 지울 수 없습니다. 최고관리자만 볼 수 있습니다.</p></div></div>
@@ -1087,6 +1112,53 @@ async function accountsView(){
   </tbody></table></div></div>`;
 }
 
+/* ---------- 거주지 자동완성 (시·도 / 시·군·구, 2026년 기준) ---------- */
+const REGIONS = {
+  '서울특별시':'종로구 중구 용산구 성동구 광진구 동대문구 중랑구 성북구 강북구 도봉구 노원구 은평구 서대문구 마포구 양천구 강서구 구로구 금천구 영등포구 동작구 관악구 서초구 강남구 송파구 강동구',
+  '부산광역시':'중구 서구 동구 영도구 부산진구 동래구 남구 북구 해운대구 사하구 금정구 강서구 연제구 수영구 사상구 기장군',
+  '대구광역시':'중구 동구 서구 남구 북구 수성구 달서구 달성군 군위군',
+  '인천광역시':'중구 동구 제물포구 영종구 미추홀구 연수구 남동구 부평구 계양구 서구 검단구 강화군 옹진군',
+  '광주광역시':'동구 서구 남구 북구 광산구',
+  '대전광역시':'동구 중구 서구 유성구 대덕구',
+  '울산광역시':'중구 남구 동구 북구 울주군',
+  '세종특별자치시':'세종시',
+  '경기도':'수원시 성남시 의정부시 안양시 부천시 광명시 평택시 동두천시 안산시 고양시 과천시 구리시 남양주시 오산시 시흥시 군포시 의왕시 하남시 용인시 파주시 이천시 안성시 김포시 화성시 광주시 양주시 포천시 여주시 연천군 가평군 양평군',
+  '강원특별자치도':'춘천시 원주시 강릉시 동해시 태백시 속초시 삼척시 홍천군 횡성군 영월군 평창군 정선군 철원군 화천군 양구군 인제군 고성군 양양군',
+  '충청북도':'청주시 충주시 제천시 보은군 옥천군 영동군 증평군 진천군 괴산군 음성군 단양군',
+  '충청남도':'천안시 공주시 보령시 아산시 서산시 논산시 계룡시 당진시 금산군 부여군 서천군 청양군 홍성군 예산군 태안군',
+  '전북특별자치도':'전주시 군산시 익산시 정읍시 남원시 김제시 완주군 진안군 무주군 장수군 임실군 순창군 고창군 부안군',
+  '전라남도':'목포시 여수시 순천시 나주시 광양시 담양군 곡성군 구례군 고흥군 보성군 화순군 장흥군 강진군 해남군 영암군 무안군 함평군 영광군 장성군 완도군 진도군 신안군',
+  '경상북도':'포항시 경주시 김천시 안동시 구미시 영주시 영천시 상주시 문경시 경산시 의성군 청송군 영양군 영덕군 청도군 고령군 성주군 칠곡군 예천군 봉화군 울진군 울릉군',
+  '경상남도':'창원시 진주시 통영시 사천시 김해시 밀양시 거제시 양산시 의령군 함안군 창녕군 고성군 남해군 하동군 산청군 함양군 거창군 합천군',
+  '제주특별자치도':'제주시 서귀포시',
+};
+Object.keys(REGIONS).forEach(k => REGIONS[k] = REGIONS[k].split(' '));
+const SIDO_SHORT = {'서울':'서울특별시','부산':'부산광역시','대구':'대구광역시','인천':'인천광역시','광주':'광주광역시','대전':'대전광역시','울산':'울산광역시','세종':'세종특별자치시','경기':'경기도','강원':'강원특별자치도','강원도':'강원특별자치도','충북':'충청북도','충남':'충청남도','전북':'전북특별자치도','전라북도':'전북특별자치도','전남':'전라남도','경북':'경상북도','경남':'경상남도','제주':'제주특별자치도','제주도':'제주특별자치도'};
+function normSido(v){ v = String(v || '').trim(); if(!v) return ''; if(REGIONS[v]) return v; const s = v.replace(/(특별자치시|특별자치도|특별시|광역시|시|도)$/, ''); return SIDO_SHORT[v] || SIDO_SHORT[s] || Object.keys(REGIONS).find(k => k.startsWith(s)) || v; }
+function guMatches(gu){ gu = String(gu || '').trim(); if(!gu) return []; return Object.entries(REGIONS).filter(([, l]) => l.includes(gu) || l.includes(gu + '구') || l.includes(gu + '시') || l.includes(gu + '군')).map(([k]) => k); }
+function guOptions(sido){
+  const s = normSido(sido);
+  if(REGIONS[s]) return REGIONS[s].map(g => `<option value="${g}">`).join('');
+  return Object.entries(REGIONS).flatMap(([k, l]) => l.map(g => `<option value="${g}" label="${k} ${g}">`)).join('');
+}
+const regionLists = (pre, sido) => `<datalist id="${pre}-dl-sido">${Object.keys(REGIONS).map(k => `<option value="${k}">`).join('')}</datalist><datalist id="${pre}-dl-gu">${guOptions(sido)}</datalist>`;
+// 입력이 끝나면(포커스 이동·목록 선택) 이름을 표준으로 맞추고, 시·도가 비어 있으면 구·시·군으로 채움
+function regionFix(t){
+  const pre = t.dataset.region, part = t.dataset.part; if(!pre) return;
+  const sEl = document.querySelector(`[data-region="${pre}"][data-part="sido"]`), gEl = document.querySelector(`[data-region="${pre}"][data-part="gu"]`);
+  const set = (el, v) => { if(el && el.value !== v){ el.value = v; el.dispatchEvent(new Event('input', {bubbles:true})); } };
+  if(part === 'sido'){ set(sEl, normSido(sEl.value)); const dl = document.getElementById(`${pre}-dl-gu`); if(dl) dl.innerHTML = guOptions(sEl.value); }
+  if(part === 'gu' && gEl){
+    const raw = gEl.value.trim(); const sp = raw.split(/\s+/);
+    if(sp.length > 1 && REGIONS[normSido(sp[0])]){ set(sEl, normSido(sp[0])); set(gEl, sp.slice(1).join(' ')); }
+    const g = gEl.value.trim(); const s = normSido(sEl?.value);
+    const fix = REGIONS[s] ? REGIONS[s].find(x => x === g || x === g + '구' || x === g + '시' || x === g + '군') : null; if(fix) set(gEl, fix);
+    if(sEl && !sEl.value.trim()){ const m = guMatches(g); if(m.length === 1){ set(sEl, m[0]); const r = REGIONS[m[0]].find(x => x === g || x === g + '구' || x === g + '시' || x === g + '군'); if(r) set(gEl, r); } }
+    const dl = document.getElementById(`${pre}-dl-gu`); if(dl) dl.innerHTML = guOptions(sEl?.value);
+  }
+}
+document.addEventListener('change', ev => { if(ev.target.dataset?.region) regionFix(ev.target); });
+
 /* ---------- 상세 패널 ---------- */
 const FIELDS = [
   {legend:'참여자 기본 정보', items:[
@@ -1094,8 +1166,8 @@ const FIELDS = [
     {k:'current_status', label:'현재상태', type:'status'},
     {k:'birth', label:'생년월일', hint:'YY-MM-DD (예: 98-03-15)', ph:'98-03-15'},
     {k:'nationality', label:'국적', hint:'수집 여부 확정 전 · 선택 입력'},
-    {k:'residence_sido', label:'거주지 시·도', ph:'서울특별시'},
-    {k:'residence_gu', label:'거주지 구·시·군', ph:'관악구'},
+    {k:'residence_sido', label:'거주지 시·도', ph:'서울 → 서울특별시', hint:'두 글자만 입력해도 목록에서 고를 수 있습니다'},
+    {k:'residence_gu', label:'거주지 구·시·군', ph:'관악 → 관악구', hint:'구·시·군만 입력하면 시·도를 자동으로 채웁니다'},
     {k:'phone', label:'휴대전화', ph:'010-0000-0000'},
     {k:'email', label:'이메일', ph:'name@example.com'},
   ]},
@@ -1106,14 +1178,13 @@ const FIELDS = [
     {k:'desired_job', label:'희망직무', type:'select', options:JOBS},
   ]},
   {legend:'수신 동의', items:[
-    {k:'consent_job_info', label:'취업정보 수신 동의', type:'yn'},
     {k:'consent_marketing', label:'마케팅 수신 동의', type:'yn'},
   ]},
   {legend:'기타 관리 정보', items:[
     {k:'note', label:'특이사항', type:'textarea', wide:true, hint:'500자 이내 · 건강, 장애, 종교, 정치 성향, 가족사 등 민감정보는 적지 마세요.'},
   ]},
 ];
-function draftFrom(p){ return {name:p.name, current_status:p.current_status, birth:birthToYY(p.birth_date), nationality:p.nationality||'', residence_sido:p.residence_sido||'', residence_gu:p.residence_gu||'', phone:p.phone||'', email:p.email||'', school:p.school||'', major:p.major||'', graduation_year:p.graduation_year ? String(p.graduation_year) : '', education:p.education||'', desired_job:p.desired_job||'', consent_job_info: p.consent_job_info == null ? '' : p.consent_job_info ? 'Y' : 'N', consent_marketing: p.consent_marketing == null ? '' : p.consent_marketing ? 'Y' : 'N', note:p.note||''}; }
+function draftFrom(p){ return {name:p.name, current_status:p.current_status, birth:birthToYY(p.birth_date), nationality:p.nationality||'', residence_sido:p.residence_sido||'', residence_gu:p.residence_gu||'', phone:p.phone||'', email:p.email||'', school:p.school||'', major:p.major||'', graduation_year:p.graduation_year ? String(p.graduation_year) : '', education:p.education||'', desired_job:p.desired_job||'', consent_marketing: p.consent_marketing == null ? '' : p.consent_marketing ? 'Y' : 'N', note:p.note||''}; }
 function dirtyKeys(){ if(!st.detail || !st.draft) return []; const o = draftFrom(st.detail); return Object.keys(st.draft).filter(k => String(st.draft[k]) !== String(o[k])); }
 function validate(d){
   const e = {};
@@ -1133,6 +1204,8 @@ function fieldHTML(it){
   else if(it.type === 'select') ctl = `<select class="select" id="${id}" data-d="${it.k}"><option value="">선택 안 함</option>${it.options.map(o => `<option ${v === o ? 'selected' : ''}>${o}</option>`).join('')}${v && !it.options.includes(v) ? `<option selected>${E(v)}</option>` : ''}</select>`;
   else if(it.type === 'yn') ctl = `<select class="select" id="${id}" data-d="${it.k}"><option value="">확인 안 됨</option><option value="Y" ${v === 'Y' ? 'selected' : ''}>동의</option><option value="N" ${v === 'N' ? 'selected' : ''}>미동의</option></select>`;
   else if(it.type === 'textarea') ctl = `<textarea class="textarea" id="${id}" data-d="${it.k}" maxlength="600">${E(v)}</textarea>`;
+  else if(it.k === 'residence_sido' || it.k === 'residence_gu'){ const part = it.k === 'residence_sido' ? 'sido' : 'gu';
+    ctl = `<input class="input" id="${id}" data-d="${it.k}" value="${E(v)}" placeholder="${E(it.ph||'')}" list="dr-dl-${part}" autocomplete="off" data-region="dr" data-part="${part}">${part === 'gu' ? regionLists('dr', st.draft.residence_sido) : ''}`; }
   else ctl = `<input class="input" id="${id}" data-d="${it.k}" value="${E(v)}" placeholder="${E(it.ph||'')}" ${it.k === 'birth' ? 'inputmode="numeric"' : ''}>`;
   const extra = it.k === 'birth' && v && yyToBirth(v) ? `<span class="hint">${yyToBirth(v).replace(/-/g,'.')} · 만 ${age(yyToBirth(v))}세 (오늘 기준)</span>` : '';
   return `<div class="f ${it.wide ? 'wide' : ''} ${err ? 'bad' : ''} ${changed ? 'changed' : ''}"><label for="${id}">${it.label}${it.req ? ' *' : ''}</label>${ctl}${err ? `<span class="err">${E(err)}</span>` : it.hint ? `<span class="hint">${E(it.hint)}</span>` : ''}${extra}</div>`;
@@ -1143,7 +1216,7 @@ function drawer(){
   const tabs = [['info','기본 정보'],['enroll',`사업 참여 ${p.enroll.length}`],['emp',`취업·창업 ${p.emps.length}`],['hist',`변경 이력 ${p.hist.length + p.chg.length}`]];
   let body = '';
   if(st.tab === 'info'){
-    body = (p.dup.length ? `<div class="warnbox"><b>중복 의심 ${p.dup.length}건</b> · ${p.dup.map(d => `<button class="link" type="button" data-open="${d.other.id}">${E(d.other.name)} (${d.other.code})</button> 이름·생년월일 일치`).join(', ')} — 통합은 STEP 3의 중복 확인 화면에서 진행합니다.</div>` : '')
+    body = (p.dup.length ? `<div class="warnbox"><b>중복 의심 ${p.dup.length}건</b>${p.dup.map(d => `<div style="margin-top:6px"><button class="link" type="button" data-open="${d.other.id}">${E(d.other.name)} (${d.other.code})</button> · ${DUP_REASON[d.reason] || E(d.reason)}<br><span class="dim">상대 참여 사업: ${d.other.enroll.map(e => `${e.program.year} ${E(e.program.name)}`).join(', ') || '없음'}</span></div>`).join('')}<div style="margin-top:8px"><button class="btn ghost sm" type="button" data-dup-of="${p.code}">중복 확인에서 처리</button></div></div>` : '')
       + FIELDS.map(g => `<fieldset><legend>${g.legend}</legend>${g.items.map(fieldHTML).join('')}</fieldset>`).join('')
       + (statusChanged ? `<div class="f wide"><label for="d-reason">상태 변경 사유 (이력에 남음)</label><input class="input" id="d-reason" data-reason value="${E(st.reason)}" placeholder="예: 10/28 전화 확인, 사후관리 설문 응답"></div>` : '');
   } else if(st.tab === 'enroll'){
@@ -1155,9 +1228,11 @@ function drawer(){
         <dl><dt>${e.kind === 'startup' ? '창업일자' : '취업일자'}</dt><dd class="num">${fmtD(e.start_date) || '-'}${e.end_date ? ` ~ ${fmtD(e.end_date)}` : ''}</dd><dt>업종</dt><dd>${E(e.industry || '-')}</dd><dt>직무</dt><dd>${E(e.job_title || '-')}</dd><dt>고용형태</dt><dd>${E(e.employment_type || '-')}</dd><dt>근무지역</dt><dd>${E(e.work_region || '-')}</dd><dt>입력 경로</dt><dd>${e.source === 'upload' ? '엑셀 업로드' : e.source === 'survey' ? '참여자 설문' : '관리자 입력'}</dd></dl>
         ${e.is_current ? `<div><button class="btn danger sm" type="button" data-end-emp="${e.id}">${e.kind === 'startup' ? '폐업 처리' : '퇴사 처리'}</button></div>` : ''}</div>`).join('') : '<div class="empty">등록된 취업·창업 기록이 없습니다.</div>');
   } else {
-    const items = [...p.hist.map(h => ({at:h.changed_at, by:h.by, html:`<b>현재상태</b> ${h.from_status ? `${chip(h.from_status)} → ` : ''}${chip(h.to_status)}${h.reason ? ` <span class="dim">· ${E(h.reason)}</span>` : ''}`})),
-      ...p.chg.map(c => ({at:c.changed_at, by:c.by, html:`<b>${E(FIELD_LABEL[c.field] || c.field)}</b> ${c.old_value != null && c.old_value !== '' ? `<s>${E(fmtVal(c.field, c.old_value))}</s> → ` : ''}${E(fmtVal(c.field, c.new_value) || '(빈 값)')}`}))].sort((a,b) => b.at.localeCompare(a.at));
-    body = `<div class="timeline">${items.map(i => `<div class="tl"><time>${fmtDT(i.at)}</time><div class="what">${i.html}<div class="by">${E(i.by)}</div></div></div>`).join('')}</div>`;
+    const items = histItems(p); const srcs = ['all', ...new Set(items.map(i => i.src))];
+    const shown = items.filter(i => st.histSrc === 'all' || i.src === st.histSrc);
+    body = `<div class="segs" role="tablist" style="margin-bottom:4px">${srcs.map(k => `<button type="button" class="seg ${st.histSrc === k ? 'on' : ''}" data-hsrc="${k}">${k === 'all' ? '전체' : SRC_LABEL[k] || k} <b>${k === 'all' ? items.length : items.filter(i => i.src === k).length}</b></button>`).join('')}</div>
+      <p style="margin:0;font-size:12px;color:var(--sub)">기록은 지우거나 고칠 수 없습니다. [이전 값으로 복구]를 누르면 그 항목이 변경 전 값으로 돌아가고, 복구한 내용도 새 기록으로 남습니다.</p>
+      <div class="timeline">${shown.map(i => `<div class="tl"><time>${fmtDT(i.at)}</time><div class="what">${i.html}<div class="by">${E(i.by || '')}${i.by ? ' · ' : ''}${SRC_LABEL[i.src] || '기록'}${i.reason ? ` · ${E(i.reason)}` : ''}</div>${i.can ? `<div style="margin-top:6px"><button class="btn ghost sm" type="button" data-restore="${i.kind}:${i.id}">이전 값으로 복구</button></div>` : ''}</div></div>`).join('') || '<div class="empty">기록이 없습니다.</div>'}</div>`;
   }
   return `<div class="scrim" data-act="close"></div>
   <aside class="drawer" role="dialog" aria-modal="true" aria-label="${E(p.name)} 상세 정보">
@@ -1167,10 +1242,43 @@ function drawer(){
       <div class="tabs" role="tablist">${tabs.map(([k,l]) => `<button type="button" role="tab" data-tab="${k}" class="${st.tab === k ? 'on' : ''}" aria-selected="${st.tab === k}">${l}</button>`).join('')}</div></div>
     <div class="db" id="dbody">${body}</div>
     ${st.tab === 'info' ? `<div class="df"><span class="msg">${dirty.length ? `수정한 항목 ${dirty.length}개 · 저장하면 변경 이력에 남습니다` : '수정할 항목을 바로 고치면 됩니다'}</span>
-      <div class="toolbar"><button class="btn ghost" type="button" data-act="revert" ${dirty.length ? '' : 'disabled'}>되돌리기</button><button class="btn" type="button" data-act="save" ${dirty.length ? '' : 'disabled'}>저장</button></div></div>` : ''}
+      <div class="toolbar"><button class="btn ghost" type="button" data-act="revert" title="저장 전 수정은 취소하고, 저장된 수정은 기록을 보고 복구합니다">되돌리기</button><button class="btn" type="button" data-act="save" ${dirty.length ? '' : 'disabled'}>저장</button></div></div>` : ''}
   </aside>`;
 }
-const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의', consent_marketing:'마케팅 수신 동의'};
+const SRC_LABEL = {admin:'직접 수정', upload:'엑셀 업로드', survey:'설문 반영', merge:'중복 통합', restore:'복구', system:'시스템', legacy:'기록'};
+const RESTORABLE = new Set(['name','birth_date','nationality','residence_sido','residence_gu','phone','email','school','major','graduation_year','education','desired_job','note','consent_marketing']);
+function histItems(p){
+  const canEdit = st.user.role !== 'viewer';
+  return [...p.hist.map(h => ({kind:'status', id:h.id, at:h.changed_at, by:h.by, src:h.source || 'legacy', reason:h.reason, can: canEdit && !!h.from_status && h.from_status !== p.current_status,
+      html:`<b>현재상태</b> ${h.from_status ? `${chip(h.from_status)} → ` : ''}${chip(h.to_status)}`, label:'현재상태', from:h.from_status ? STATUS[h.from_status] : '', to:STATUS[h.to_status], cur:STATUS[p.current_status]})),
+    ...p.chg.map(c => ({kind:'field', id:c.id, at:c.changed_at, by:c.by, src:c.source || 'legacy', reason:c.reason, can: canEdit && RESTORABLE.has(c.field) && String(p[c.field] ?? '') !== String(c.old_value ?? '') && !(c.field === 'name' && !c.old_value),
+      html:`<b>${E(FIELD_LABEL[c.field] || c.field)}</b> ${c.old_value != null && c.old_value !== '' ? `<s>${E(fmtVal(c.field, c.old_value))}</s> → ` : ''}${E(fmtVal(c.field, c.new_value) || '(빈 값)')}`,
+      label:FIELD_LABEL[c.field] || c.field, from:fmtVal(c.field, c.old_value), to:fmtVal(c.field, c.new_value), cur:fmtVal(c.field, p[c.field] == null ? null : String(p[c.field]))}))]
+    .sort((a,b) => b.at.localeCompare(a.at) || b.id - a.id);
+}
+function restoreModal(kind, id){
+  const i = histItems(st.detail).find(x => x.kind === kind && x.id === id); if(!i) return;
+  modal(`<h3>이전 값으로 복구</h3><p>${E(st.detail.name)} (${st.detail.code})의 <b>${E(i.label)}</b>을(를) ${fmtDT(i.at)} 변경 전 값으로 되돌립니다. 기존 기록은 그대로 두고 복구 기록이 새로 남습니다.</p>
+  <dl class="kv" style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0 0 12px;font-size:13px"><dt class="dim">지금 값</dt><dd style="margin:0">${E(i.cur || '(빈 값)')}</dd><dt class="dim">복구할 값</dt><dd style="margin:0;font-weight:700">${E(i.from || '(빈 값)')}</dd></dl>
+  <form id="restoreForm" novalidate><input type="hidden" name="kind" value="${kind}"><input type="hidden" name="rid" value="${id}">
+  <div class="f wide"><label for="rs-reason">복구 사유 (선택, 이력에 남음)</label><input class="input" id="rs-reason" name="reason" placeholder="예: 잘못 입력해서 되돌림"></div>
+  <div id="rs-err" style="margin-top:8px"></div>
+  <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">복구</button></div></form>`);
+}
+function recentModal(){
+  const items = histItems(st.detail).filter(i => i.can).slice(0, 8);
+  modal(`<h3>수정 기록 확인 · 복구</h3><p>저장하지 않은 수정은 없습니다. 이미 저장된 최근 변경을 확인하고, 필요한 항목을 변경 전 값으로 되돌릴 수 있습니다.</p>
+  ${items.length ? `<div class="timeline">${items.map(i => `<div class="tl"><time>${fmtDT(i.at)}</time><div class="what">${i.html}<div class="by">${E(i.by || '')} · ${SRC_LABEL[i.src] || '기록'}</div><div style="margin-top:6px"><button class="btn ghost sm" type="button" data-restore="${i.kind}:${i.id}">이전 값으로 복구</button></div></div></div>`).join('')}</div>` : '<div class="empty">되돌릴 수 있는 저장된 변경이 없습니다.</div>'}
+  <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="hist-all">전체 변경 이력 보기</button><button class="btn" type="button" data-act="modal-close">닫기</button></div>`);
+}
+async function doRestore(fd){
+  const kind = String(fd.get('kind')), id = +fd.get('rid'), reason = String(fd.get('reason') || '').trim();
+  try{
+    const p = await store.restoreChange(kind, id, reason); closeModal();
+    st.detail = p; st.draft = draftFrom(p); st.errs = {}; st.reason = ''; refreshDrawer(); toast('이전 값으로 복구했습니다. 변경 이력에 복구 기록이 남았습니다.'); renderMain();
+  }catch(e){ $('#rs-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; }
+}
+const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', consent_marketing:'마케팅 수신 동의'};
 function fmtVal(f, v){ if(v == null) return ''; if(f === 'birth_date') return birthToYY(String(v)); if(f.startsWith('consent')) return v === true || v === 'true' ? '동의' : v === false || v === 'false' ? '미동의' : ''; return String(v); }
 function refreshDrawer(keepScroll = true){
   const old = document.querySelector('.drawer'); const sc = $('#dbody')?.scrollTop || 0; const focusId = document.activeElement?.id; const sel = document.activeElement?.selectionStart;
@@ -1191,12 +1299,12 @@ const UP_FIELDS = [
   ['nationality','국적'],['residence','거주지'],['phone','휴대전화'],['email','이메일'],
   ['school','학교명'],['major','전공'],['graduation_year','졸업 연도'],['education','학력'],['desired_job','희망직무'],
   ['employment.start_date','취업(창업)일자'],['employment.company','회사명'],['employment.industry','업종'],['employment.job_title','직무'],['employment.employment_type','고용형태'],['employment.work_region','근무지역'],
-  ['note','특이사항'],['consent_job_info','취업정보 수신 동의'],['consent_marketing','마케팅 수신 동의'],
+  ['note','특이사항'],['consent_marketing','마케팅 수신 동의'],
   ['__exclude__','항상 제외(저장 금지)'],
 ];
 const UP_LABEL = Object.fromEntries(UP_FIELDS);
 const hk = h => String(h ?? '').replace(/\s/g,'');
-const DEFAULT_ALIASES = {'사업년도':'program.year','사업연도':'program.year','연도':'program.year','사업명':'program.name','프로그램명':'program.name','운영기간':'program.period','수료일':'enrollment.completion_date','구직상태':'enrollment.entry_type','이름':'name','성명':'name','현재상태':'current_status','취업상태':'current_status','취업정보수신동의':'consent_job_info','마케팅수신동의':'consent_marketing','나이(년생기입)':'birth_date','생년월일':'birth_date','나이':'age','국적':'nationality','거주지(구)':'residence','거주지':'residence','휴대전화':'phone','휴대폰':'phone','연락처':'phone','전화번호':'phone','이메일':'email','메일':'email','학교명':'school','학교':'school','전공':'major','졸업년도':'graduation_year','졸업연도':'graduation_year','학력':'education','희망직무':'desired_job','취업(창업)일자':'employment.start_date','취업일자':'employment.start_date','입사일':'employment.start_date','회사명':'employment.company','기업명':'employment.company','업종':'employment.industry','직무':'employment.job_title','고용형태':'employment.employment_type','근무지역':'employment.work_region','특이사항':'note','연번':'__skip__','비고':'__skip__','상담내용':'__exclude__','컨설팅진행모습':'__exclude__'};
+const DEFAULT_ALIASES = {'사업년도':'program.year','사업연도':'program.year','연도':'program.year','사업명':'program.name','프로그램명':'program.name','운영기간':'program.period','수료일':'enrollment.completion_date','구직상태':'enrollment.entry_type','이름':'name','성명':'name','현재상태':'current_status','취업상태':'current_status','취업정보수신동의':'__skip__','채용정보수신동의':'__skip__','마케팅수신동의':'consent_marketing','나이(년생기입)':'birth_date','생년월일':'birth_date','나이':'age','국적':'nationality','거주지(구)':'residence','거주지':'residence','휴대전화':'phone','휴대폰':'phone','연락처':'phone','전화번호':'phone','이메일':'email','메일':'email','학교명':'school','학교':'school','전공':'major','졸업년도':'graduation_year','졸업연도':'graduation_year','학력':'education','희망직무':'desired_job','취업(창업)일자':'employment.start_date','취업일자':'employment.start_date','입사일':'employment.start_date','회사명':'employment.company','기업명':'employment.company','업종':'employment.industry','직무':'employment.job_title','고용형태':'employment.employment_type','근무지역':'employment.work_region','특이사항':'note','연번':'__skip__','비고':'__skip__','상담내용':'__exclude__','컨설팅진행모습':'__exclude__'};
 const LOCKED_EXCLUDE = new Set(['상담내용','컨설팅진행모습']);   // 2026-10-28 확정: 저장하지 않음
 const MAX_ROWS = 5000, MAX_MB = 10, CHUNK = 40;
 const up0 = () => ({step:'pick', filename:'', sheets:{}, sheet:'', headerRow:0, mapping:{}, manual:{}, learned:{}, defaults:{year:'', name:'', period:''}, ageBase:todayISO(), overwrite:false, rows:null, filter:'all', page:1, uploadId:null, progress:0, summary:null, err:'', busy:false});
@@ -1284,7 +1392,7 @@ function normRow(raw, u){
   ['school','major','education','desired_job'].forEach(k => n[k] = sv(g(k)) || null);
   const gy = sv(g('graduation_year')); if(gy){ const m = gy.match(/^(\d{4}|\d{2})/); if(m) n.graduation_year = m[1].length === 2 ? (+m[1] <= curYY() ? 2000 : 1900) + +m[1] : +m[1]; else warnings.push(`졸업 연도 '${gy}'를 읽지 못했습니다`); }
   let note = sv(g('note')); if(note.length > 500){ warnings.push('특이사항이 500자를 넘어 뒷부분을 잘랐습니다'); note = note.slice(0,500); } n.note = note || null;
-  ['consent_job_info','consent_marketing'].forEach(k => { const c = parseConsent(g(k)); n[k] = c.v; if(c.warn) warnings.push(c.warn); });
+  ['consent_marketing'].forEach(k => { const c = parseConsent(g(k)); n[k] = c.v; if(c.warn) warnings.push(c.warn); });
   // 취업·창업
   const company = sv(g('employment.company')), sd = g('employment.start_date');
   if(company || sv(sd)){
@@ -1318,7 +1426,7 @@ async function readWorkbook(file){
   wb.SheetNames.forEach((n, idx) => { const ws = wb.Sheets[n]; if(!ws['!ref']) return; const off = XLSX.utils.decode_range(ws['!ref']).s.r; const hidden = !!(wb.Workbook && wb.Workbook.Sheets && wb.Workbook.Sheets[idx] && wb.Workbook.Sheets[idx].Hidden); sheets[n] = {aoa: XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null, blankrows:true}), offset: off, hidden}; });
   return sheets;
 }
-function aliasFor(h){ const k = hk(h); if(!k) return null; if(LOCKED_EXCLUDE.has(k)) return '__exclude__'; return st.up.learned[k] || DEFAULT_ALIASES[k] || null; }
+function aliasFor(h){ const k = hk(h); if(!k) return null; if(LOCKED_EXCLUDE.has(k)) return '__exclude__'; const a = st.up.learned[k] || DEFAULT_ALIASES[k] || null; return a && !UP_LABEL[a] ? '__skip__' : a; }
 function detectHeader(aoa){ for(let i = 0; i < Math.min(15, aoa.length); i++){ if((aoa[i] || []).filter(c => aliasFor(c)).length >= 3) return i; } const f = aoa.findIndex(nonEmpty); return f < 0 ? 0 : f; }
 function sheetStats(name){ const s = st.up.sheets[name]; const h = detectHeader(s.aoa); const pc = personCols(s.aoa[h]); return {h, data: s.aoa.slice(h + 1).filter(r => nonEmpty(r) && hasPerson(r, pc)).length, blank: s.aoa.slice(h + 1).filter(r => nonEmpty(r) && !hasPerson(r, pc)).length}; }
 function setSheet(name){ const u = st.up; u.sheet = name; u.headerRow = detectHeader(u.sheets[name].aoa); buildMapping(); }
@@ -1444,13 +1552,13 @@ function sampleSheets(kind){
   let ph = kind === 'std' ? 5001 : 6001; const phone = (fmt) => { const d = String(ph++); return fmt === 0 ? `010-0000-${d}` : fmt === 1 ? `0100000${d}` : fmt === 2 ? `010 0000 ${d}` : Number(`100000${d}`); };
   const birth = () => { const y = 1993 + Math.floor(R() * 11), m = 1 + Math.floor(R() * 12), d = 1 + Math.floor(R() * 28); const f = Math.floor(R() * 4); return f === 0 ? `${y}.${pad(m)}.${pad(d)}` : f === 1 ? `${String(y).slice(2)}-${pad(m)}-${pad(d)}` : f === 2 ? `${y}${pad(m)}${pad(d)}` : `${String(y).slice(2)}${pad(m)}${pad(d)}`; };
   if(kind === 'std'){
-    const H = ['연번','사업년도','사업명','운영 기간','이름','현재 상태','취업정보 수신 동의','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','특이사항'];
+    const H = ['연번','사업년도','사업명','운영 기간','이름','현재 상태','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','특이사항'];
     const progs = [['관악_면접리허설','2026.04.21-2026.04.30'],['관악_신입가이드','2026.09.01~2026.09.12'],['26년 서울형 청년인턴 직무캠프','2026.07.06~2026.08.14']];
     const rows = []; let no = 1;
     const row = o => rows.push(H.map(h => o[h] ?? null));
     for(let i = 0; i < 34; i++){
       const [pn, per] = pick(progs); const st0 = pick(['','','','구직중','취업','타기업 취업','학생','취업계획없음','창업']);
-      const o = {'연번':no++, '사업년도':2026, '사업명':pn, '운영 기간':per, '이름':nm(), '현재 상태':st0, '취업정보 수신 동의':pick(['동의','미동의','']), '마케팅 수신 동의':pick(['동의','미동의','']), '나이(년생기입)':birth(), '거주지(구)':pick(['서울시 관악구','서울 동작구','경기도 성남시','미파악','']), '휴대전화':phone(i % 4), '이메일':R() < .5 ? `sample${ph}@example.com` : '', '학교명':pick(['한빛대학교','누리대학교','']), '전공':pick(['경영학','통계학','']), '졸업년도':pick([2024,2025,'26','']), '희망직무':pick(JOBS)};
+      const o = {'연번':no++, '사업년도':2026, '사업명':pn, '운영 기간':per, '이름':nm(), '현재 상태':st0, '마케팅 수신 동의':pick(['동의','미동의','']), '나이(년생기입)':birth(), '거주지(구)':pick(['서울시 관악구','서울 동작구','경기도 성남시','미파악','']), '휴대전화':phone(i % 4), '이메일':R() < .5 ? `sample${ph}@example.com` : '', '학교명':pick(['한빛대학교','누리대학교','']), '전공':pick(['경영학','통계학','']), '졸업년도':pick([2024,2025,'26','']), '희망직무':pick(JOBS)};
       if(['취업','타기업 취업','창업'].includes(st0)) Object.assign(o, {'취업(창업)일자':pick(['2026.05.02','26.06.01','20260715']), '회사명':pick(['(주)가상물산','예시소프트','샘플커머스']), '업종':'IT·플랫폼', '직무':pick(JOBS), '고용형태':st0 === '창업' ? '' : pick(['정규직','계약직','인턴']), '근무지역':'서울'});
       row(o);
     }
@@ -1469,7 +1577,7 @@ function sampleSheets(kind){
     for(let i = 0; i < 20; i++) rows.push(H.map(() => null));
     return {'2026년': {aoa:[H, ...rows], offset:0}, '데이터': {aoa:[['구분','전체','2024','2025','2026'],['관리 인원',null,null,null,null]], offset:0}};
   }
-  const H = ['비고','사업년도','사업명','운영 기간','수료일','이름','구직 상태','현재 상태','취업정보 수신 동의','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','직업 가치관','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','상담 내용','어학 및 자격','경험 및 경력','특이사항','컨설팅 진행 모습'];
+  const H = ['비고','사업년도','사업명','운영 기간','수료일','이름','구직 상태','현재 상태','마케팅 수신 동의','나이(년생기입)','국적','거주지(구)','휴대전화','이메일','학교명','전공','졸업년도','학력','희망직무','직업 가치관','취업(창업)일자','회사명','업종','직무','고용형태','근무지역','상담 내용','어학 및 자격','경험 및 경력','특이사항','컨설팅 진행 모습'];
   const progs = [['관악_PT발표법','2026.02.20.~2026.02.27','2026.02.27'],['관악_IT직무프리뷰_UI/UX디자이너','2026.03.20-2025.03.27','2026.03.27'],['관악_IT직무프리뷰_PMPO편','2026.05.15-2026.05.29','2026.05.29']];
   const ENTRY = ['대학 재학생','이직 또는 경력 전환 고민자','졸업 후 6개월 이상 미취업자','재직자','기타'];
   const rows = [Array(H.length).fill(null), H];
@@ -1593,24 +1701,47 @@ async function historyView(){
 
 /* ---------- 중복 확인 · 통합 ---------- */
 const DUP_REASON = {same_phone:'휴대전화 일치 · 이름 다름', same_email:'이메일 일치 · 이름 다름', same_name_birth:'이름 · 생년월일 일치', same_name_only:'이름만 일치'};
+st.dupf = {reason:'all', program:'all', q:'', shared:''}; st.dpage = 1;
+const progLine = (e, shared) => `<span class="${shared.has(e.program_id ?? e.program.id) ? 'hl' : ''}">${e.program.year} · ${E(e.program.name)}</span>${e.upload_name ? ` <span class="dim">(${E(e.upload_name)})</span>` : ''}`;
 async function dupView(){
-  const list = await store.duplicates(); const owner = st.user.role === 'owner';
-  const side = (p, o, d) => { const diff = (a, b) => (a ?? '') !== (b ?? '') ? 'diff' : '';
-    const cur = p.emps.find(e => e.is_current);
+  const f = st.dupf; const size = 20;
+  const r = await store.duplicates(f, st.dpage, size); const owner = st.user.role === 'owner'; const canEdit = st.user.role !== 'viewer';
+  const br = r.by_reason || {}; const all = Object.values(br).reduce((a, b) => a + b, 0);
+  const side = (p, o, d, shared) => { const diff = (a, b) => (a ?? '') !== (b ?? '') ? 'diff' : '';
+    const cur = (p.emps || []).find(e => e.is_current);
     return `<div class="side"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="link" type="button" data-open="${p.id}" style="font-size:15px">${E(p.name)}</button><span class="mono dim">${p.code}</span>${chip(p.current_status)}</div>
-      <dl><dt>생년월일</dt><dd class="num ${diff(p.birth_date, o.birth_date)}">${p.birth_date ? birthToYY(p.birth_date) : '-'}</dd>
+      <dl><dt>참여 사업</dt><dd>${p.enroll.map(e => progLine(e, shared)).join('<br>') || '-'}</dd>
+      <dt>생년월일</dt><dd class="num ${diff(p.birth_date, o.birth_date)}">${p.birth_date ? birthToYY(p.birth_date) : '-'}</dd>
       <dt>휴대전화</dt><dd class="num ${diff(p.phone, o.phone)}">${E(maskPhone(p.phone)) || '-'}</dd>
       <dt>이메일</dt><dd class="${diff(p.email, o.email)}">${E(p.email || '-')}</dd>
       <dt>거주지</dt><dd>${E([p.residence_sido, p.residence_gu].filter(Boolean).join(' ') || '-')}</dd>
-      <dt>참여 사업</dt><dd>${p.enroll.map(e => `${E(e.program.name)} <span class="dim">${e.program.year}</span>`).join('<br>') || '-'}</dd>
       <dt>현재 직장</dt><dd>${E(cur?.company || '-')}</dd>
       <dt>최초 등록</dt><dd class="num">${fmtD(p.created_at)}</dd></dl>
       ${owner ? `<div class="acts"><button class="btn sm" type="button" data-merge="${d.id}:${p.id}">이 참여자로 통합</button></div>` : ''}</div>`; };
+  const summary = d => {
+    if(d.shared && d.shared.length) return `<span class="badge b-error">같은 사업 중복</span> ${d.shared.map(s => `${s.year} · ${E(s.name)}`).join(', ')}에 두 사람이 모두 등록되어 있습니다`;
+    const pa = d.a.enroll.map(e => `${e.program.year} ${E(e.program.name)}`).join(', ') || '사업 없음', pb = d.b.enroll.map(e => `${e.program.year} ${E(e.program.name)}`).join(', ') || '사업 없음';
+    return `<span class="badge b-link">다른 사업</span> ${E(d.a.code)}: ${pa} / ${E(d.b.code)}: ${pb}`;
+  };
+  const progs = store.programs();
+  const segs = [['all', '전체', all], ['same_phone', '휴대전화 일치', br.same_phone || 0], ['same_email', '이메일 일치', br.same_email || 0], ['same_name_birth', '이름·생년월일 일치', br.same_name_birth || 0]];
   return `<div class="head"><div><h1>중복 확인</h1><p>같은 사람으로 의심되는 쌍입니다. 자동으로 합치지 않습니다. 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고, 다른 쪽은 '통합됨'으로 보관합니다.</p></div></div>
-  ${owner ? '' : '<div class="warnbox">통합은 최고관리자만 할 수 있습니다. 같은 사람이 아니면 \'다른 사람입니다\'로 목록에서 내릴 수 있습니다.</div>'}
-  ${list.length ? list.map(d => `<section class="dup"><div class="dt"><span><span class="badge b-dup">${d.score}점</span> ${DUP_REASON[d.reason] || d.reason}</span><button class="btn ghost sm" type="button" data-dismiss="${d.id}">다른 사람입니다</button></div>
-    <div class="cmp">${side(d.a, d.b, d)}${side(d.b, d.a, d)}</div></section>`).join('') : '<div class="panel"><div class="empty">확인할 중복 의심이 없습니다.</div></div>'}
-  <p style="margin:0;font-size:12px;color:var(--sub)">판단 기준: 휴대전화 일치(100점) · 이메일 일치(90점) · 이름+생년월일 일치(70점). 주황색 값은 두 사람의 값이 다른 항목입니다. 통합하면 남는 쪽의 빈 칸만 다른 쪽 값으로 채웁니다.</p>`;
+  ${owner ? '' : `<div class="warnbox">통합은 최고관리자만 할 수 있습니다.${canEdit ? ' 같은 사람이 아니면 \'다른 사람입니다\'로 목록에서 내릴 수 있습니다.' : ''}</div>`}
+  <div class="panel">
+    <div class="segs" role="tablist">${segs.map(([k, l, n]) => `<button type="button" role="tab" class="seg ${f.reason === k ? 'on' : ''}" data-dupr="${k}" aria-selected="${f.reason === k}">${l} <b>${fmtNum(n)}</b></button>`).join('')}</div>
+    <form class="toolbar" id="dupfilters" role="search" style="margin-top:12px">
+      <input class="input search" id="dq" name="q" placeholder="이름 · 관리번호" value="${E(f.q)}" aria-label="검색어">
+      <select class="select" name="program" aria-label="사업"><option value="all">전체 사업</option>${progs.map(p => `<option value="${p.id}" ${+f.program === p.id ? 'selected' : ''}>${p.year} · ${E(p.name)}</option>`).join('')}</select>
+      <select class="select" name="shared" aria-label="중복 유형"><option value="">사업 구분 없이</option><option value="1" ${f.shared === '1' ? 'selected' : ''}>같은 사업 안 중복만 (${fmtNum(r.shared_n || 0)})</option></select>
+      <button class="btn" type="submit">검색</button><button class="btn ghost" type="button" data-act="dup-reset">초기화</button>
+    </form>
+    <div class="tablebar"><span class="count"><b>${fmtNum(r.total)}</b>쌍</span></div>
+  </div>
+  ${r.rows.length ? r.rows.map(d => { const shared = new Set((d.shared || []).map(s => s.id)); return `<section class="dup"><div class="dt"><span><span class="badge b-dup">${d.score}점</span> ${DUP_REASON[d.reason] || E(d.reason)}</span>${canEdit ? `<button class="btn ghost sm" type="button" data-dismiss="${d.id}">다른 사람입니다</button>` : ''}</div>
+    <div class="dsum">${summary(d)}</div>
+    <div class="cmp">${side(d.a, d.b, d, shared)}${side(d.b, d.a, d, shared)}</div></section>`; }).join('') : '<div class="panel"><div class="empty">조건에 맞는 중복 의심이 없습니다.</div></div>'}
+  ${r.total > size ? `<div class="panel">${pager(r.total, st.dpage, size, 'data-dpage', '쌍')}</div>` : ''}
+  <p style="margin:0;font-size:12px;color:var(--sub)">판단 기준: 휴대전화 일치(100점) · 이메일 일치(90점) · 이름+생년월일 일치(70점). 굵게 표시한 사업은 두 사람이 함께 등록된 사업이고, 괄호 안은 그 참여 이력을 올린 엑셀 파일입니다. 주황색 값은 두 사람의 값이 다른 항목입니다. 통합하면 남는 쪽의 빈 칸만 다른 쪽 값으로 채웁니다.</p>`;
 }
 function mergeModal(dupId, keepId){
   modal(`<h3>참여자 통합</h3><p>선택한 참여자를 남기고, 다른 쪽의 사업 참여·취업·상태 이력을 옮깁니다. 다른 쪽 기록은 지우지 않고 '통합됨'으로 보관하며, 이 작업은 작업 기록에 남습니다.</p>
@@ -1653,7 +1784,7 @@ document.addEventListener('click', async ev => {
     if(a === 'commit-go') return commitUpload();
     if(a === 'export-check') return exportUploadRows(u.rows, '업로드검사');
     if(a === 'export-result') return exportUploadRows(u.rows, `업로드${u.uploadId}_결과`);
-    if(a === 'go-people'){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all'}; st.sort = 'updated_at'; st.dir = 'desc'; st.page = 1; return setView('people'); }
+    if(a === 'go-people'){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all', dup:''}; st.sort = 'updated_at'; st.dir = 'desc'; st.page = 1; return setView('people'); }
     if(a === 'backup') return downloadBackup();
     if(a === 'revert-go'){ const id = +el.dataset.id; closeModal(); try{ await store.revertUpload(id); if(st.up.uploadId === id) st.up = up0(); toast(`업로드 #${id}을 되돌렸습니다.`); }catch(e){ toast(e.message); } return renderMain(); }
     return;
@@ -1665,6 +1796,10 @@ document.addEventListener('click', async ev => {
     return modal(`<h3>업로드 #${x.id} 되돌리기</h3><p>${E(x.filename)}로 새로 등록한 참여자 ${fmtNum(x.summary?.created)}명과 참여 이력을 지우고, 기존 참여자 ${fmtNum(x.summary?.linked)}명에게 채운 값과 상태 변경을 이전으로 돌립니다. 되돌린 내용도 기록에 남습니다.</p><div class="acts"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn danger" type="button" data-up="revert-go" data-id="${x.id}">되돌리기</button></div>`); }
   if((el = t.closest('[data-merge]'))){ const [d, k] = el.dataset.merge.split(':').map(Number); return mergeModal(d, k); }
   if((el = t.closest('[data-merge-go]'))){ const [d, k] = el.dataset.mergeGo.split(':').map(Number); closeModal(); try{ const r = await store.merge(d, k); toast(`${r.lose}을 ${r.keep}로 통합했습니다. 참여 이력 ${r.moved}건을 옮겼습니다.`); }catch(e){ toast(e.message); } return renderMain(); }
+  if((el = t.closest('[data-dupr]'))){ st.dupf.reason = el.dataset.dupr; st.dpage = 1; return renderMain(); }
+  if((el = t.closest('[data-dpage]'))){ st.dpage = +el.dataset.dpage; await renderMain(); window.scrollTo(0,0); return; }
+  if((el = t.closest('[data-act="dup-reset"]'))){ st.dupf = {reason:'all', program:'all', q:'', shared:''}; st.dpage = 1; return renderMain(); }
+  if((el = t.closest('[data-dup-of]'))){ const code = el.dataset.dupOf; if(st.detail && dirtyKeys().length) return; st.dupf = {reason:'all', program:'all', q:code, shared:''}; st.dpage = 1; closeDetail(true); return setView('duplicates'); }
   if((el = t.closest('[data-dismiss]'))){ await store.dismissDuplicate(+el.dataset.dismiss); toast('다른 사람으로 표시하고 목록에서 내렸습니다.'); return renderMain(); }
 });
 document.addEventListener('change', async ev => {
@@ -1729,6 +1864,8 @@ function personModal(){
     <div class="f"><label for="np-phone">휴대전화</label><input class="input" id="np-phone" name="phone" placeholder="010-0000-0000" inputmode="tel"></div>
     <div class="f"><label for="np-email">이메일</label><input class="input" id="np-email" name="email" type="email" placeholder="name@example.com"></div>
     <div class="f"><label for="np-birth">생년월일</label><input class="input" id="np-birth" name="birth" placeholder="98-03-15" inputmode="numeric"></div>
+    <div class="f"><label for="np-sido">거주지 시·도</label><input class="input" id="np-sido" name="residence_sido" list="np-dl-sido" autocomplete="off" data-region="np" data-part="sido" placeholder="서울 → 서울특별시"></div>
+    <div class="f"><label for="np-gu">거주지 구·시·군</label><input class="input" id="np-gu" name="residence_gu" list="np-dl-gu" autocomplete="off" data-region="np" data-part="gu" placeholder="관악 → 관악구">${regionLists('np', '')}</div>
     <div class="f"><label for="np-job">희망직무</label><select class="select" id="np-job" name="desired_job"><option value="">선택 안 함</option>${JOBS.map(j => `<option>${j}</option>`).join('')}</select></div>
     <div class="f"><label for="np-year">사업 연도</label><input class="input" id="np-year" name="year" value="${new Date().getFullYear()}" inputmode="numeric"></div>
     <div class="f"><label for="np-program">사업명</label><input class="input" id="np-program" name="program" list="np-programs" placeholder="목록에서 고르거나 새로 입력"><datalist id="np-programs">${[...new Set(progs.map(p => p.name))].map(n => `<option value="${E(n)}">`).join('')}</datalist></div>
@@ -1742,7 +1879,7 @@ async function submitPerson(fd){
   const email = g('email') ? g('email').toLowerCase() : null; if(email && !validEmail(email)) return err('이메일 형식이 맞지 않습니다.');
   const birth = g('birth') ? yyToBirth(g('birth').replace(/^(\d{2})(\d{2})(\d{2})$/, '$1-$2-$3')) : null; if(g('birth') && !birth) return err('생년월일은 YY-MM-DD 형식으로 입력하세요. 예: 98-03-15');
   if(g('program') && !/^\d{4}$/.test(g('year'))) return err('사업 연도를 네 자리로 입력하세요.');
-  const data = {name:g('name'), current_status:g('current_status') || 'unknown', phone, email, birth_date:birth, desired_job:g('desired_job') || null};
+  const data = {name:g('name'), current_status:g('current_status') || 'unknown', phone, email, birth_date:birth, desired_job:g('desired_job') || null, residence_sido:normSido(g('residence_sido')) || null, residence_gu:g('residence_gu') || null};
   try{
     const p = await store.create(data, g('program') ? {year:+g('year'), name:g('program')} : null);
     closeModal(); toast(`${p.name}님을 ${p.code}로 등록했습니다.${p.dup && p.dup.length ? ` 중복 의심 ${p.dup.length}건이 있습니다.` : ''}`);
@@ -1758,7 +1895,7 @@ function confirmClose(next){
    동작
    ===================================================================== */
 async function openDetail(id){
-  const go = async () => { st.detail = await store.get(id); st.draft = draftFrom(st.detail); st.errs = {}; st.reason = ''; if(!['info','enroll','emp','hist'].includes(st.tab)) st.tab = 'info'; refreshDrawer(false); markSel(); };
+  const go = async () => { st.histSrc = 'all'; st.detail = await store.get(id); st.draft = draftFrom(st.detail); st.errs = {}; st.reason = ''; if(!['info','enroll','emp','hist'].includes(st.tab)) st.tab = 'info'; refreshDrawer(false); markSel(); };
   if(st.detail && dirtyKeys().length) return confirmClose(go);
   go();
 }
@@ -1817,10 +1954,12 @@ document.addEventListener('click', async ev => {
   const q = sel => t.closest(sel);
   let el;
   if((el = q('[data-view]'))) return setView(el.dataset.view);
-  if((el = q('[data-go-people]'))){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all'}; st.page = 1; return setView('people'); }
+  if((el = q('[data-go-people]'))){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
   if((el = q('[data-go-emp]'))){ st.ef = {status:el.dataset.goEmp, year:'all', program:'all'}; st.epage = 1; return setView('employment'); }
-  if((el = q('[data-go-program]'))){ const p = store.programs().find(x => x.id === +el.dataset.goProgram); st.f = {q:'', year:String(p.year), program:String(p.id), status:'all', job:'all'}; st.page = 1; return setView('people'); }
+  if((el = q('[data-go-program]'))){ const p = store.programs().find(x => x.id === +el.dataset.goProgram); st.f = {q:'', year:String(p.year), program:String(p.id), status:'all', job:'all', dup:''}; st.page = 1; return setView('people'); }
   if((el = q('[data-open]'))){ ev.preventDefault(); return openDetail(+el.dataset.open); }
+  if((el = q('[data-restore]'))){ const [k, i] = el.dataset.restore.split(':'); return restoreModal(k, +i); }
+  if((el = q('[data-hsrc]'))){ st.histSrc = el.dataset.hsrc; return refreshDrawer(); }
   if((el = q('[data-sort]'))){ const k = el.dataset.sort; if(st.view !== 'people') return; st.dir = st.sort === k && st.dir === 'desc' ? 'asc' : 'desc'; st.sort = k; st.page = 1; return renderMain(); }
   if((el = q('[data-page]'))){ st.page = +el.dataset.page; await renderMain(); $('.tw')?.scrollTo(0,0); return; }
   if((el = q('[data-epage]'))){ st.epage = +el.dataset.epage; return renderMain(); }
@@ -1830,19 +1969,21 @@ document.addEventListener('click', async ev => {
   if((el = q('[data-admin-active]'))){ const [id, on] = el.dataset.adminActive.split(':'); try{ await store.setAdminActive(id, on === '1'); toast(on === '1' ? '다시 사용하도록 바꿨습니다.' : '사용을 중지했습니다. 이 계정은 더 이상 데이터를 볼 수 없습니다.'); }catch(e){ toast(e.message); } return renderMain(); }
   if((el = q('[data-act]'))){
     const a = el.dataset.act;
+    if(a === 'retry') return renderMain();
     if(a === 'close'){ if(el.classList.contains('scrim') && t !== el) return; return closeDetail(); }
     if(a === 'logout'){ await store.logout(); st.user = null; st.detail = null; render(); return toast('로그아웃했습니다.'); }
     if(a === 'pw') return pwModal();
     if(a === 'modal-close') return closeModal();
     if(a === 'discard'){ closeModal(); st.draft = draftFrom(st.detail); const n = confirmClose.next; confirmClose.next = null; return n && n(); }
-    if(a === 'reset'){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all'}; st.page = 1; return renderMain(); }
+    if(a === 'reset'){ st.f = {q:'', year:'all', program:'all', status:'all', job:'all', dup:''}; st.page = 1; return renderMain(); }
     if(a === 'cols'){ st.colOpen = !st.colOpen; return renderMain(); }
     if(a === 'cols-default'){ st.cols = DEFAULT_COLS.slice(); store_ls.set('cl.cols', st.cols); return renderMain(); }
     if(a === 'cols-all'){ st.cols = COLS.map(c => c.key); store_ls.set('cl.cols', st.cols); return renderMain(); }
     if(a === 'export') return exportXlsx(st.f, '참여자');
     if(a === 'export-emp') return exportXlsx({...st.ef, q:'', job:'all'}, `취업현황_${st.ef.status === 'all' ? '전체' : STATUS[st.ef.status]}`);
     if(a === 'save') return save();
-    if(a === 'revert'){ st.draft = draftFrom(st.detail); st.errs = {}; st.reason = ''; return refreshDrawer(); }
+    if(a === 'revert'){ if(!dirtyKeys().length) return recentModal(); st.draft = draftFrom(st.detail); st.errs = {}; st.reason = ''; toast('저장하지 않은 수정을 취소했습니다.'); return refreshDrawer(); }
+    if(a === 'hist-all'){ closeModal(); st.tab = 'hist'; st.histSrc = 'all'; return refreshDrawer(false); }
     if(a === 'add-emp') return empModal();
     if(a === 'new-person') return personModal();
   }
@@ -1853,6 +1994,7 @@ document.addEventListener('change', ev => {
   if(t.dataset.col){ const k = t.dataset.col; st.cols = t.checked ? COLS.map(c => c.key).filter(x => x === k || st.cols.includes(x)) : st.cols.filter(x => x !== k); store_ls.set('cl.cols', st.cols); return renderMain(); }
   const form = t.closest('form');
   if(form?.id === 'filters' && t.tagName === 'SELECT'){ st.f[t.name] = t.value; if(t.name === 'year') st.f.program = 'all'; st.page = 1; return renderMain(); }
+  if(form?.id === 'dupfilters' && t.tagName === 'SELECT'){ st.dupf[t.name] = t.value; st.dpage = 1; return renderMain(); }
   if(form?.id === 'efilters'){ st.ef[t.name] = t.value; if(t.name === 'year') st.ef.program = 'all'; st.epage = 1; return renderMain(); }
   if(t.dataset.d && t.tagName === 'SELECT'){ st.draft[t.dataset.d] = t.value; delete st.errs[t.dataset.d]; refreshDrawer(); }
 });
@@ -1865,7 +2007,7 @@ document.addEventListener('input', ev => {
     // 라벨 '수정됨' 표시와 하단 저장 버튼만 갱신 (입력 중 커서 유지)
     const f = t.closest('.f'); f?.classList.toggle('changed', String(v) !== String(draftFrom(st.detail)[t.dataset.d])); f?.classList.remove('bad');
     const n = dirtyKeys().length; const msg = $('.df .msg'); if(msg) msg.textContent = n ? `수정한 항목 ${n}개 · 저장하면 변경 이력에 남습니다` : '수정할 항목을 바로 고치면 됩니다';
-    document.querySelectorAll('[data-act="save"],[data-act="revert"]').forEach(b => b.disabled = !n);
+    document.querySelectorAll('[data-act="save"]').forEach(b => b.disabled = !n);
     if(t.dataset.d === 'birth' && (v.length === 8 || v.length === 0)) refreshDrawer();
   }
   if(t.dataset.reason !== undefined) st.reason = t.value;
@@ -1880,6 +2022,8 @@ async function handleSubmit(f){
     return;
   }
   if(f.id === 'filters'){ st.f.q = String(fd.get('q') || '').trim(); st.page = 1; return renderMain(); }
+  if(f.id === 'dupfilters'){ st.dupf.q = String(fd.get('q') || '').trim(); st.dpage = 1; return renderMain(); }
+  if(f.id === 'restoreForm') return doRestore(fd);
   if(f.id === 'personForm') return submitPerson(fd);
   if(f.id === 'adminForm'){ try{ await store.registerAdmin(String(fd.get('email')).trim(), String(fd.get('name')).trim(), fd.get('role')); toast('관리자로 등록했습니다. 임시 비밀번호로 로그인하면 비밀번호 변경을 안내합니다.'); }catch(e){ toast(e.message); } return renderMain(); }
   if(f.id === 'empForm'){
@@ -1901,7 +2045,7 @@ document.addEventListener('submit', async ev => {
   if(f.dataset.busy) return;
   f.dataset.busy = '1';
   const btns = [...f.querySelectorAll('button[type=submit]')];
-  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(f.id !== 'filters' && f.id !== 'loginForm') b.textContent = '처리 중…'; });
+  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(!['filters','dupfilters','loginForm'].includes(f.id)) b.textContent = '처리 중…'; });
   try{ await handleSubmit(f); }
   catch(e){ toast(e.message); }
   finally{ delete f.dataset.busy; if(f.isConnected) btns.forEach(b => { b.disabled = false; b.textContent = b.dataset.label; }); }
