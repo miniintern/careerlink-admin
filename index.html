@@ -302,6 +302,8 @@ table.afm th[scope=row]{text-align:left;font-weight:600;white-space:nowrap}
 .afbar .b{height:10px;background:var(--mute-soft);border-radius:99px;overflow:hidden}
 .afbar .b i{display:block;height:100%;background:var(--accent);border-radius:99px}
 .afbar .n{font-size:12.5px;text-align:right;color:var(--sub)}
+.mchk{display:flex;gap:8px;align-items:flex-start;font-size:13px;cursor:pointer}.mchk input{margin-top:3px;accent-color:var(--accent)}
+.mextra{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line-strong);display:flex;flex-direction:column;gap:8px}.mextra .textarea{min-height:110px;font-size:12.5px;font-family:ui-monospace,Menlo,Consolas,monospace}
 .mcount{margin-top:12px;display:flex;flex-direction:column;gap:3px;font-size:14px}.mcount small{color:var(--sub);font-size:12px}
 .mkind{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
 .mkind label{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line-strong);border-radius:10px;padding:10px 12px;font-size:13px;cursor:pointer}
@@ -894,7 +896,10 @@ function makeSupabaseStore(cfg){
     async logExport(target, rows){ return audit('export_xlsx', target, {rows}); },
     /* 메일 보내기 */
     async mailList(page){ return rpc('mail_list', {page, size:30}); },
-    async mailPreview(f, ad){ return rpc('mail_preview', {f, is_ad:!!ad}); },
+    async mailPreview(f, ad, extra, useDb, extraOk){ return rpc('mail_preview', {f, is_ad:!!ad, extra:extra || [], use_db:useDb !== false, extra_ok:!!extraOk}); },
+    async mailOptoutList(q){ return rpc('mail_optout_list', {q: q || null}); },
+    async mailOptoutAdd(emails, reason){ return rpc('mail_optout_add', {emails, reason: reason || null}); },
+    async mailOptoutRemove(email){ return rpc('mail_optout_remove', {email}); },
     async mailCreate(m){ return rpc('mail_create', {m}); },
     async mailStatus(cid){ return rpc('mail_status', {cid}); },
     async mailCancel(cid){ return rpc('mail_cancel', {cid}); },
@@ -1356,7 +1361,85 @@ async function handleAftercareForm(f, fd){
 const MAIL_ST = {ready:'대기', sending:'보내는 중', done:'완료', canceled:'중단'};
 const newMailTarget = () => ({scope:'all', year:'all', biz:'all', intent:'all', seg:'all', support:'all', job:'all', marketing:'all', linked:'', q:''});
 st.mail = {mode:'list', cid:null, page:1}; st.md = null; st.mprev = null; st.mailBusy = null; st.mailCur = null; st.mailStop = false;
-const newMailDraft = (target) => ({subject:'', body:'{{이름}}님, 안녕하세요.\n오픈놀 커리어성장사업부입니다.\n\n', is_ad:true, target:{...newMailTarget(), ...(target || {})}, testTo:st.user?.email || ''});
+const newMailDraft = (target) => ({subject:'', body:'{{이름}}님, 안녕하세요.\n오픈놀 커리어성장사업부입니다.\n\n', is_ad:true, target:{...newMailTarget(), ...(target || {})}, testTo:st.user?.email || '',
+  use_db:true, extraText:'', extra:[], extraBad:[], extra_ok:false});
+// 직접 넣은 받는 사람: 한 줄에 한 명 (이름, 이메일 / 이메일만)
+function parseExtra(text){
+  const out = [], bad = [];
+  for(const raw of String(text || '').split(/\r?\n/)){
+    const line = raw.trim(); if(!line) continue;
+    const m = line.match(/[^\s,;<>"'()]+@[^\s,;<>"'()]+\.[^\s,;<>"'()]+/);
+    if(!m){ bad.push(line); out.push({email:line.slice(0, 100)}); continue; }
+    const name = line.replace(m[0], ' ').replace(/[<>()"',;\t]/g, ' ').replace(/\s+/g, ' ').trim();
+    out.push({email:m[0], name:name.slice(0, 60)});
+  }
+  return {extra:out.slice(0, 20000), bad};
+}
+function mailCountHtml(p, d){
+  const parts = [];
+  if(d.use_db) parts.push(`참여자 DB에서 ${fmtNum(p.from_db)}명 · 조건에 맞는 ${fmtNum(p.matched)}명 중 이메일 없음 ${fmtNum(p.no_email)}명${d.is_ad ? ` · 마케팅 수신 미동의·미선택 ${fmtNum(p.no_consent)}명` : ''} 제외`);
+  if(p.extra_input) parts.push(`직접 추가 ${fmtNum(p.from_extra)}명 · ${fmtNum(p.extra_input)}줄 중 형식 오류·중복 ${fmtNum(p.extra_input - p.extra_valid)}줄${p.extra_in_db ? ` · 참여자 DB에 있는 주소 ${fmtNum(p.extra_in_db)}개` : ''}${p.extra_refused ? ` · DB에서 수신 거부한 ${fmtNum(p.extra_refused)}명 제외` : ''}${p.extra_blocked ? ` · <b style="color:var(--bad)">수신 동의 확인에 체크하지 않아 ${fmtNum(p.extra_blocked)}개 제외</b>` : ''}`);
+  if(p.optout) parts.push(`수신 거부 목록에 있는 ${fmtNum(p.optout)}명 제외`);
+  if(d.use_db || p.extra_input) parts.push('같은 이메일은 한 번만 보냅니다');
+  const bad = d.extraBad || [];
+  return `<span>받는 사람 <b>${fmtNum(p.count)}</b>명</span>${parts.map(x => `<small>${x}</small>`).join('')}
+    ${bad.length ? `<small style="color:var(--bad)">이메일을 찾지 못한 줄 ${fmtNum(bad.length)}개: ${bad.slice(0, 3).map(E).join(' / ')}${bad.length > 3 ? ' …' : ''}</small>` : ''}
+    ${p.sample?.length ? `<small>예: ${p.sample.map(E).join(', ')}${p.count > p.sample.length ? ' 외' : ''}</small>` : ''}`;
+}
+let mailCountSeq = 0;
+async function refreshMailCount(){
+  const d = st.md; if(!d) return; const seq = ++mailCountSeq;
+  const px = parseExtra(d.extraText); d.extra = px.extra; d.extraBad = px.bad;
+  let p; try{ p = await store.mailPreview(d.target, d.is_ad, d.extra, d.use_db, d.extra_ok); }catch(e){ return toast(e.message); }
+  if(seq !== mailCountSeq) return; st.mprev = p;
+  const box = $('#mail-count'); if(box) box.innerHTML = mailCountHtml(p, d);
+  const go = $('[data-act="mail-go"]'); if(go){ go.disabled = !p.count; go.textContent = `${fmtNum(p.count)}명에게 보내기`; }
+  const s = st.mailSettings || {daily_limit:0}, room = Math.max(s.daily_limit - (st.mailUsed ?? 0), 0), note = $('#mail-roomnote');
+  if(note) note.textContent = p.count > room ? `오늘은 ${fmtNum(room)}명까지 보내고, 남은 ${fmtNum(p.count - room)}명은 다음 날부터 [이어서 보내기]로 보냅니다 (하루 ${fmtNum(s.daily_limit)}통 한도).` : '';
+}
+async function importExtraFile(file){
+  if(file.size > 10 * 1024 * 1024) return toast('10MB 이하 파일만 불러올 수 있습니다.');
+  const wb = XLSX.read(await file.arrayBuffer(), {type:'array'});
+  const hidden = n => (wb.Workbook?.Sheets || []).find(s => s.name === n)?.Hidden;
+  const sn = wb.SheetNames.find(n => !hidden(n)) || wb.SheetNames[0];
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[sn], {header:1, defval:'', raw:false});
+  const isEm = v => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(v).trim());
+  let hr = -1, ec = -1, nc = -1;
+  for(let i = 0; i < Math.min(rows.length, 10); i++){
+    const r = rows[i].map(x => String(x).replace(/\s/g, '').toLowerCase());
+    const e = r.findIndex(x => /이메일|e-?mail|메일주소|^메일$/.test(x));
+    if(e >= 0){ hr = i; ec = e; nc = r.findIndex(x => /^(이름|성명|성함|name)$/.test(x)); break; }
+  }
+  if(ec < 0){
+    const cnt = {}; rows.slice(0, 300).forEach(r => r.forEach((v, j) => { if(isEm(v)) cnt[j] = (cnt[j] || 0) + 1; }));
+    const best = Object.entries(cnt).sort((a, b) => b[1] - a[1])[0];
+    if(!best) return toast('이메일 주소가 있는 열을 찾지 못했습니다. 첫 줄에 "이메일"이라는 제목을 넣어 주세요.');
+    ec = +best[0];
+  }
+  const lines = [];
+  rows.slice(hr + 1).forEach(r => { const e = String(r[ec] ?? '').trim(); if(!e) return; const n = nc >= 0 ? String(r[nc] ?? '').trim().replace(/[,\n]/g, ' ') : ''; lines.push(n ? `${n}, ${e}` : e); });
+  if(!lines.length) return toast('불러올 이메일이 없습니다.');
+  st.md.extraText = (st.md.extraText.trim() ? st.md.extraText.trim() + '\n' : '') + lines.join('\n');
+  toast(`${file.name}에서 ${fmtNum(lines.length)}줄을 불러왔습니다. 아래 숫자를 확인해 주세요.`);
+  return renderMain();
+}
+function downloadExtraTemplate(){
+  const ws = XLSX.utils.aoa_to_sheet([['이름', '이메일'], ['홍길동', 'hong@example.com']]); ws['!cols'] = [{wch:12}, {wch:30}];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '받는 사람');
+  try{ XLSX.writeFile(wb, '메일_받는사람_양식.xlsx'); }catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다.'); }
+}
+async function optoutModal(){
+  let r; try{ r = await store.mailOptoutList(''); }catch(e){ return toast(e.message); }
+  const canEdit = st.user.role !== 'viewer';
+  modal(`<h3>수신 거부 목록 <small class="dim" style="font-weight:400">${fmtNum(r.total)}개</small></h3>
+    <p>여기 있는 주소에는 <b>광고성 메일</b>을 보내지 않습니다. 참여자 DB에 있는 사람이면 상세정보에서 마케팅 수신 동의도 '미동의'로 바꿔 주세요.</p>
+    ${canEdit ? `<form id="optoutForm" novalidate style="display:flex;flex-direction:column;gap:8px">
+      <div class="f"><label for="oo-e">추가할 이메일 (한 줄에 하나씩)</label><textarea class="textarea" id="oo-e" name="emails" rows="3"></textarea></div>
+      <div class="f"><label for="oo-r">사유 (선택)</label><input class="input" id="oo-r" name="reason" placeholder="예: 11/20 메일 회신으로 수신 거부"></div>
+      <div class="acts"><button class="btn ghost" type="button" data-act="modal-close">닫기</button><button class="btn" type="submit">추가</button></div></form>` : ''}
+    <div style="max-height:240px;overflow:auto;border-top:1px solid var(--line)">${r.rows.length ? `<table class="grid"><tbody>${r.rows.map(x => `<tr><td style="overflow-wrap:anywhere">${E(x.email)}<br><small class="dim">${fmtD(x.created_at)} · ${E(x.by || '')}${x.reason ? ' · ' + E(x.reason) : ''}</small></td><td style="text-align:right">${canEdit ? `<button class="btn ghost sm" type="button" data-optout-del="${E(x.email)}">빼기</button>` : ''}</td></tr>`).join('')}</tbody></table>` : '<div class="empty" style="padding:16px">아직 없습니다.</div>'}</div>
+    ${canEdit ? '' : '<div class="acts"><button class="btn ghost" type="button" data-act="modal-close">닫기</button></div>'}`);
+}
 
 // 본문 서식(간단한 표기) → 메일용 HTML. 입력은 모두 이스케이프한 뒤 허용한 표기만 바꿉니다.
 function mailHtml(src){
@@ -1404,7 +1487,7 @@ async function mailView(){
   const r = await store.mailList(st.mail.page); st.mailSettings = r.settings; st.mailUsed = r.used_today;
   const canEdit = st.user.role !== 'viewer', s = r.settings;
   return `<div class="head"><div><h1>메일 보내기</h1><p>참여자에게 안내 메일을 보냅니다. 오늘 <b>${fmtNum(r.used_today)}</b> / ${fmtNum(s.daily_limit)}통 사용 · 한도를 넘는 건은 다음 날 [이어서 보내기]로 보냅니다.</p></div>
-    <span class="toolbar">${st.user.role === 'owner' ? '<button class="btn ghost" type="button" data-act="mail-settings">발송 설정</button>' : ''}${canEdit ? '<button class="btn" type="button" data-act="mail-new">새 메일 쓰기</button>' : ''}</span></div>
+    <span class="toolbar"><button class="btn ghost" type="button" data-act="mail-optout">수신 거부 목록</button>${st.user.role === 'owner' ? '<button class="btn ghost" type="button" data-act="mail-settings">발송 설정</button>' : ''}${canEdit ? '<button class="btn" type="button" data-act="mail-new">새 메일 쓰기</button>' : ''}</span></div>
   <div class="panel">${r.rows.length ? `<div class="tw"><table class="grid"><thead><tr><th>만든 날</th><th>제목</th><th>구분</th><th class="num">받는 사람</th><th class="num">보냄</th><th class="num">실패</th><th class="num">남음</th><th>상태</th><th>작성자</th></tr></thead><tbody>
     ${r.rows.map(x => `<tr data-mail="${x.id}"><td class="num">${fmtDT(x.created_at)}</td><td class="name">${E(x.subject)}</td><td>${x.is_ad ? '<span class="tag">광고성</span>' : '<span class="tag">정보성</span>'}</td>
       <td class="num">${fmtNum(x.total)}</td><td class="num">${fmtNum(x.sent)}</td><td class="num">${x.failed ? `<b style="color:var(--bad)">${fmtNum(x.failed)}</b>` : 0}</td><td class="num">${fmtNum(x.pending)}</td>
@@ -1418,15 +1501,17 @@ function mailTargetChips(t){
 async function mailComposeView(){
   const d = st.md || (st.md = newMailDraft());
   if(!st.mailSettings){ const r = await store.mailList(1); st.mailSettings = r.settings; st.mailUsed = r.used_today; }
-  const t = d.target; const p = st.mprev = await store.mailPreview(t, d.is_ad);
+  const px = parseExtra(d.extraText); d.extra = px.extra; d.extraBad = px.bad;
+  const t = d.target; const p = st.mprev = await store.mailPreview(t, d.is_ad, d.extra, d.use_db, d.extra_ok);
   const progs = store.programs(); const years = [...new Set(progs.map(x => x.year))].sort((a, b) => b - a);
   const bizs = [...new Set(progs.filter(x => t.year === 'all' || String(x.year) === String(t.year)).map(x => x.biz_name || x.name))].sort();
   const opt = (v, l, cur) => `<option value="${E(v)}" ${String(cur) === String(v) ? 'selected' : ''}>${E(l)}</option>`;
   const chips = mailTargetChips(t);
   const s = st.mailSettings, room = Math.max(s.daily_limit - (st.mailUsed ?? 0), 0);
   return `<div class="head"><div><h1>새 메일 쓰기</h1><p>받는 사람을 고르고 내용을 쓴 뒤, 먼저 [테스트 발송]으로 본인 메일함에서 확인하세요.</p></div><button class="btn ghost" type="button" data-act="mail-list">목록으로</button></div>
-  <div class="panel"><div class="ph"><h2>1. 받는 사람</h2><small>참여자 통합 DB의 이메일로 보냅니다 · 삭제·통합된 참여자 제외</small></div>
-    <form class="toolbar" id="mailtarget">
+  <div class="panel"><div class="ph"><h2>1. 받는 사람</h2><small>참여자 DB에서 고르거나, 주소를 직접 넣을 수 있습니다 (둘 다 가능)</small></div>
+    <label class="mchk"><input type="checkbox" id="mail-usedb" ${d.use_db ? 'checked' : ''}><span><b>참여자 통합 DB에서 고르기</b> <small class="dim">삭제·통합된 참여자 제외</small></span></label>
+    ${d.use_db ? `<form class="toolbar" id="mailtarget" style="margin-top:8px">
       <select class="select" name="scope" aria-label="범위">${opt('all','전체 참여자',t.scope)}${opt('resp','조사에 응답한 참여자',t.scope)}</select>
       <select class="select" name="year" aria-label="사업 연도">${opt('all','사업 연도 전체',t.year)}${years.map(y => opt(y, y + '년', t.year)).join('')}</select>
       <select class="select" name="biz" aria-label="사업명">${opt('all','사업 전체',t.biz)}${bizs.map(b => opt(b, b, t.biz)).join('')}</select>
@@ -1435,10 +1520,16 @@ async function mailComposeView(){
       ${d.is_ad ? '' : `<select class="select" name="marketing" aria-label="마케팅 수신">${opt('all','마케팅 수신 전체',t.marketing)}${opt('Y','동의',t.marketing)}${opt('N','미동의',t.marketing)}${opt('none','선택 안 함',t.marketing)}</select>`}
       <select class="select" name="linked" aria-label="계정 연결">${opt('','계정 연결 여부 전체',t.linked)}${opt('1','참여자 계정 연결자만',t.linked)}</select>
     </form>
-    ${chips.length ? `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${chips.map(c => `<span class="tag" style="font-size:12px;padding:3px 8px">${E(c)}</span>`).join('')}<button class="btn ghost sm" type="button" data-act="mail-clear-extra">조건 지우기</button></div>` : ''}
-    <div class="mcount"><span>받는 사람 <b>${fmtNum(p.count)}</b>명</span>
-      <small>조건에 맞는 ${fmtNum(p.matched)}명 중 이메일 없음 ${fmtNum(p.no_email)}명${d.is_ad ? ` · 마케팅 수신 미동의·미선택 ${fmtNum(p.no_consent)}명` : ''}${p.same_email ? ` · 같은 이메일 ${fmtNum(p.same_email)}건은 한 번만` : ''} 제외</small>
-      ${p.sample?.length ? `<small>예: ${p.sample.map(E).join(', ')}${p.count > p.sample.length ? ' 외' : ''}</small>` : ''}</div>
+    ${chips.length ? `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${chips.map(c => `<span class="tag" style="font-size:12px;padding:3px 8px">${E(c)}</span>`).join('')}<button class="btn ghost sm" type="button" data-act="mail-clear-extra">조건 지우기</button></div>` : ''}` : ''}
+    <div class="mextra">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><b style="font-size:13.5px">받는 사람 직접 추가 <small class="dim" style="font-weight:400">참여자 DB에 없는 주소도 됩니다</small></b>
+        <span class="toolbar"><label class="btn ghost sm" for="mail-xlsx" style="cursor:pointer">엑셀에서 불러오기</label><input type="file" id="mail-xlsx" accept=".xlsx,.xls,.csv" hidden>
+        <button class="btn ghost sm" type="button" data-act="mail-xtpl">엑셀 양식</button>${d.extraText.trim() ? '<button class="btn ghost sm" type="button" data-act="mail-xclear">비우기</button>' : ''}</span></div>
+      <textarea class="textarea" id="mail-extra" rows="5" aria-label="직접 추가할 받는 사람" placeholder="한 줄에 한 명씩 '이름, 이메일' (이메일만 써도 됩니다)&#10;홍길동, hong@example.com">${E(d.extraText)}</textarea>
+      <small class="dim">엑셀은 이 브라우저 안에서만 읽고 따로 저장하지 않습니다. 첫 줄에 '이름', '이메일' 제목이 있으면 그 열을 씁니다. 직접 넣은 주소는 참여자 DB에 등록되지 않고 이 메일의 발송 명단에만 남습니다.</small>
+      ${d.is_ad ? `<label class="mchk"><input type="checkbox" id="mail-extraok" ${d.extra_ok ? 'checked' : ''}><span>직접 넣은 주소는 <b>광고성 정보 수신 동의를 받은 주소</b>입니다. <small class="dim">체크하지 않으면 광고성 메일에서 빠집니다. 동의 기록은 따로 보관해 주세요.</small></span></label>` : ''}
+    </div>
+    <div class="mcount" id="mail-count">${mailCountHtml(p, d)}</div>
   </div>
   <div class="panel"><div class="ph"><h2>2. 내용</h2><small>오른쪽 미리보기는 받는 사람 화면과 거의 같습니다</small></div>
     <div class="mkind" role="radiogroup" aria-label="메일 구분">
@@ -1456,7 +1547,7 @@ async function mailComposeView(){
       <button class="btn ghost" type="button" data-act="mail-test">테스트 발송</button>
       <span style="flex:1"></span>
       <button class="btn" type="button" data-act="mail-go" ${p.count ? '' : 'disabled'}>${fmtNum(p.count)}명에게 보내기</button></div>
-    ${p.count > room ? `<p style="margin:10px 0 0;font-size:12.5px;color:var(--sub)">오늘은 ${fmtNum(room)}명까지 보내고, 남은 ${fmtNum(p.count - room)}명은 다음 날부터 [이어서 보내기]로 보냅니다 (하루 ${fmtNum(s.daily_limit)}통 한도).</p>` : ''}
+    <p id="mail-roomnote" style="margin:10px 0 0;font-size:12.5px;color:var(--sub)">${p.count > room ? `오늘은 ${fmtNum(room)}명까지 보내고, 남은 ${fmtNum(p.count - room)}명은 다음 날부터 [이어서 보내기]로 보냅니다 (하루 ${fmtNum(s.daily_limit)}통 한도).` : ''}</p>
   </div>`;
 }
 
@@ -1487,7 +1578,7 @@ function mailGoModal(){
   if(!d.subject.trim()) return toast('제목을 입력하세요.');
   if(!d.body.trim()) return toast('본문을 입력하세요.');
   modal(`<h3>${fmtNum(p.count)}명에게 메일을 보낼까요?</h3>
-    <p>제목: <b>${E((d.is_ad ? '(광고) ' : '') + d.subject)}</b><br>${d.is_ad ? '광고성 안내 · 마케팅 수신 동의자에게만 보냅니다.' : '정보성 안내 · 홍보 내용이 없는지 한 번 더 확인해 주세요.'}</p>
+    <p>${d.use_db ? `참여자 DB ${fmtNum(p.from_db)}명` : ''}${d.use_db && p.from_extra ? ' + ' : ''}${p.from_extra ? `직접 추가 ${fmtNum(p.from_extra)}명` : ''}<br>제목: <b>${E((d.is_ad ? '(광고) ' : '') + d.subject)}</b><br>${d.is_ad ? '광고성 안내 · 마케팅 수신 동의자에게만 보냅니다.' : '정보성 안내 · 홍보 내용이 없는지 한 번 더 확인해 주세요.'}</p>
     <p style="font-size:12.5px;color:var(--sub)">보낸 메일은 되돌릴 수 없습니다. 아직 보내지 않은 남은 건은 [발송 중단]으로 멈출 수 있습니다. 보내는 동안 이 화면을 열어 두세요.</p>
     <form id="mailGoForm" novalidate><div class="acts"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">보내기 시작</button></div></form>`);
 }
@@ -1534,6 +1625,10 @@ document.addEventListener('click', async ev => {
   if((el = t.closest('[data-act="mail-new"]'))){ st.md = newMailDraft(); st.mail = {mode:'compose', cid:null, page:st.mail.page}; return renderMain(); }
   if((el = t.closest('[data-act="mail-list"]'))){ st.mail = {mode:'list', cid:null, page:st.mail.page}; return renderMain(); }
   if((el = t.closest('[data-act="mail-settings"]'))) return mailSettingsModal();
+  if((el = t.closest('[data-act="mail-optout"]'))) return optoutModal();
+  if((el = t.closest('[data-optout-del]'))){ if(!confirm(`${el.dataset.optoutDel}을(를) 수신 거부 목록에서 뺄까요?`)) return; try{ await store.mailOptoutRemove(el.dataset.optoutDel); await optoutModal(); }catch(e){ toast(e.message); } return; }
+  if((el = t.closest('[data-act="mail-xtpl"]'))) return downloadExtraTemplate();
+  if((el = t.closest('[data-act="mail-xclear"]'))){ st.md.extraText = ''; return renderMain(); }
   if((el = t.closest('[data-act="mail-clear-extra"]'))){ Object.assign(st.md.target, {support:'all', job:'all', q:''}); return renderMain(); }
   if((el = t.closest('[data-act="mail-go"]'))) return mailGoModal();
   if((el = t.closest('[data-act="mail-pause"]'))){ st.mailStop = true; el.disabled = true; el.textContent = '멈추는 중…'; return; }
@@ -1552,12 +1647,16 @@ document.addEventListener('click', async ev => {
 });
 let mailPrevTimer = null;
 document.addEventListener('input', ev => {
-  const id = ev.target.id; if(!st.md || !['mail-subject','mail-body','mail-testto'].includes(id)) return;
+  const id = ev.target.id; if(!st.md || !['mail-subject','mail-body','mail-testto','mail-extra'].includes(id)) return;
+  if(id === 'mail-extra'){ st.md.extraText = ev.target.value; clearTimeout(mailPrevTimer); mailPrevTimer = setTimeout(refreshMailCount, 600); return; }
   if(id === 'mail-subject') st.md.subject = ev.target.value; else if(id === 'mail-body') st.md.body = ev.target.value; else st.md.testTo = ev.target.value;
   clearTimeout(mailPrevTimer); mailPrevTimer = setTimeout(() => { const box = $('#mail-prev'); if(box) box.innerHTML = mailPreviewBox(st.md.subject, st.md.body, st.md.is_ad); }, 150);
 });
 document.addEventListener('change', ev => {
   if(st.view !== 'mail' || !st.md) return;
+  if(ev.target.id === 'mail-usedb'){ st.md.use_db = ev.target.checked; return renderMain(); }
+  if(ev.target.id === 'mail-extraok'){ st.md.extra_ok = ev.target.checked; return refreshMailCount(); }
+  if(ev.target.id === 'mail-xlsx'){ const fl = ev.target.files?.[0]; ev.target.value = ''; if(fl) importExtraFile(fl).catch(e => toast('파일을 읽지 못했습니다: ' + e.message)); return; }
   if(ev.target.name === 'mail-ad'){ st.md.is_ad = ev.target.value === '1'; if(st.md.is_ad) st.md.target.marketing = 'all'; return renderMain(); }
   if(ev.target.closest('form')?.id === 'mailtarget'){ st.md.target[ev.target.name] = ev.target.value; if(ev.target.name === 'year') st.md.target.biz = 'all'; return renderMain(); }
 });
@@ -1565,8 +1664,16 @@ async function handleMailForm(f, fd){
   if(f.id === 'mailtarget') return true;
   if(f.id === 'mailGoForm'){
     const d = st.md; const btn = f.querySelector('[type=submit]'); btn.disabled = true; btn.textContent = '명단 만드는 중…';
-    try{ const c = await store.mailCreate({subject:d.subject.trim(), body_src:d.body, body_html:mailHtml(d.body), is_ad:d.is_ad, target:d.target}); closeModal(); st.md = null; runMailSend(c.id); }
+    const px = parseExtra(d.extraText);
+    try{ const c = await store.mailCreate({subject:d.subject.trim(), body_src:d.body, body_html:mailHtml(d.body), is_ad:d.is_ad, target:d.target, use_db:d.use_db, extra:px.extra, extra_ok:d.is_ad && d.extra_ok}); closeModal(); st.md = null; runMailSend(c.id); }
     catch(e){ btn.disabled = false; btn.textContent = '보내기 시작'; toast(e.message); }
+    return true;
+  }
+  if(f.id === 'optoutForm'){
+    const emails = String(fd.get('emails') || '').split(/[\s,;]+/).map(x => x.trim()).filter(Boolean);
+    if(!emails.length) return toast('추가할 이메일을 입력하세요.'), true;
+    try{ const r = await store.mailOptoutAdd(emails, String(fd.get('reason') || '').trim()); toast(`${fmtNum(r.added)}개를 수신 거부 목록에 넣었습니다.`); await optoutModal(); if(st.mail.mode === 'compose') refreshMailCount(); }
+    catch(e){ toast(e.message); }
     return true;
   }
   if(f.id === 'mailSetForm'){
@@ -1732,7 +1839,7 @@ async function dupView_old(){
   return `<div class="head"><div><h1>중복 확인</h1><p>STEP 3에서 통합 기능을 구현합니다. 현재 가상 데이터에 이름·생년월일이 같은 의심 쌍이 ${s.dups}건 있습니다.</p></div></div>
   <div class="panel"><p style="margin:0;color:var(--sub);font-size:13px;line-height:1.7">판단 기준: 휴대전화 일치(100점) → 이메일 일치(90점) → 이름+생년월일 일치(70점) → 이름만 일치(30점, 참고). 자동 통합은 하지 않고, 관리자가 확인한 뒤 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고 다른 쪽은 '통합됨'으로 보존합니다. 참여자 상세 화면의 기본 정보 탭 상단에서도 의심 대상을 확인할 수 있습니다.</p></div>`;
 }
-const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가', issue_link_codes:'연결 코드 발급', account_link:'계정 연결', account_unlink:'계정 연결 해제', link_reject:'연결 요청 반려', survey_cycle:'조사 회차 저장', aftercare_intent:'사후관리 희망 변경', mail_create:'메일 발송 시작', mail_test:'테스트 메일', mail_cancel:'메일 발송 중단', mail_retry:'메일 재발송', mail_settings:'발송 설정 변경'};
+const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가', issue_link_codes:'연결 코드 발급', account_link:'계정 연결', account_unlink:'계정 연결 해제', link_reject:'연결 요청 반려', survey_cycle:'조사 회차 저장', aftercare_intent:'사후관리 희망 변경', mail_create:'메일 발송 시작', mail_test:'테스트 메일', mail_cancel:'메일 발송 중단', mail_retry:'메일 재발송', mail_settings:'발송 설정 변경', mail_optout_add:'수신 거부 추가', mail_optout_remove:'수신 거부 삭제'};
 async function logsView(){
   const l = await store.auditLog();
   return `<div class="head"><div><h1>작업 기록</h1><p>로그인, 상세 조회, 수정, 다운로드가 자동으로 남습니다. 기록은 수정하거나 지울 수 없습니다. 최고관리자만 볼 수 있습니다.</p></div></div>
