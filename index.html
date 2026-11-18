@@ -852,6 +852,18 @@ function makeSupabaseStore(cfg){
     async deleteParticipant(id, reason){ return rpc('delete_participant', {pid:id, reason}); },
     async undeleteParticipant(id){ return rpc('undelete_participant', {pid:id}); },
     async addEnrollment(id, prg){ const r = await rpc('add_enrollment', {pid:id, prg}); await refreshCaches(); return r; },
+    /* 참여자 페이지 연동 */
+    async portalCounts(){ return rpc('portal_counts'); },
+    async cycles(){ return rpc('list_survey_cycles'); },
+    async saveCycle(c){ return rpc('save_survey_cycle', {c}); },
+    async responses(f, page, size){ return rpc('list_survey_responses', {f, page, size}); },
+    async markChecked(ids){ return rpc('mark_responses_checked', {ids}); },
+    async accountStatus(f, page, size){ return rpc('list_account_status', {f, page, size}); },
+    async issueCodes(pids, days){ return rpc('issue_link_codes', {pids, days}); },
+    async linkRequests(s){ return rpc('list_link_requests', {st:s}); },
+    async approveLink(id, pid, createNew){ const r = await rpc('approve_link_request', {req_id:id, pid, create_new:!!createNew}); await refreshCaches(); return r; },
+    async rejectLink(id, note){ return rpc('reject_link_request', {req_id:id, note}); },
+    async unlinkAccount(pid, reason){ return rpc('unlink_account', {pid, reason}); },
     async listDeleted(q = '', page = 1, size = 50){ return rpc('list_deleted_participants', {q, page, size}); },
     async purgeParticipant(id, code){ return rpc('purge_participant', {pid:id, confirm_code:code}); },
     async dupCount(){ try{ return await rpc('dup_count'); }catch{ const r = await q(sb.from('duplicate_candidates').select('id', {count:'exact', head:true}).eq('status', 'pending')); return r?.count || 0; } },
@@ -912,7 +924,7 @@ const EMP_COLS = ['code','name','status','program','emp_start','company','indust
 /* =====================================================================
    상태
    ===================================================================== */
-const VIEWS = ['dashboard','people','employment','upload','duplicates','backup','logs','accounts'];
+const VIEWS = ['dashboard','people','employment','upload','duplicates','surveys','links','backup','logs','accounts'];
 const st = {
   user:null, view:'dashboard', loginErr:'', busy:false,
   f:{q:'', year:'all', biz:'all', program:'all', status:'all', job:'all', dup:''}, sort:'updated_at', dir:'desc', page:1, size:50,
@@ -965,6 +977,9 @@ function sidebar(){
       ${nb('employment','취업 현황 관리')}
       ${nb('upload','엑셀 업로드')}
       ${nb('duplicates','중복 확인', st.dupCount ? `<span class="cnt">${st.dupCount}</span>` : '')}
+      ${store.live ? `<div class="grp">참여자 페이지</div>
+      ${nb('surveys','취업 현황 조사', st.pc?.survey_new ? `<span class="cnt">${st.pc.survey_new}</span>` : '')}
+      ${nb('links','계정 연결', st.pc?.link_pending ? `<span class="cnt">${st.pc.link_pending}</span>` : '')}` : ''}
       <div class="grp">운영</div>
       ${owner ? nb('backup','전체 백업') : ''}
       ${owner ? nb('logs','작업 기록') : ''}
@@ -990,17 +1005,220 @@ async function renderMain(){
   else if(v === 'backup') m.innerHTML = await backupView();
   else if(v === 'logs') m.innerHTML = await logsView();
   else if(v === 'accounts') m.innerHTML = await accountsView();
+  else if(v === 'surveys') m.innerHTML = await surveysView();
+  else if(v === 'links') m.innerHTML = await linksView();
   }catch(e){ console.error(e); m.innerHTML = `<div class="head"><div><h1>화면을 불러오지 못했습니다</h1><p>${E(e.message || String(e))}</p></div></div><div class="panel"><p style="margin:0 0 12px;font-size:13px;color:var(--sub)">잠시 뒤 다시 시도해 주세요. 같은 문제가 계속되면 이 메시지를 캡처해 공유해 주세요.</p><button class="btn" type="button" data-act="retry">다시 시도</button></div>`; }
   let dc = st.dupCount; try{ dc = await store.dupCount(); }catch{}
   if(dc !== st.dupCount){ st.dupCount = dc; const s = document.querySelector('.side'); if(s) s.outerHTML = sidebar(); }
+  await refreshPortalCounts();
   updateIdle();
+}
+
+/* =====================================================================
+   참여자 페이지 연동 (10번 SQL): 계정 연결 · 취업 현황 조사 관리
+   ===================================================================== */
+const SEG_LABEL = {seeker:'구직자', worker:'재직자', unknown:'미확인'};
+const segOf = s => ['employed','startup'].includes(s) ? 'worker' : s === 'unknown' ? 'unknown' : 'seeker';
+const AFTER_LABEL = {yes:'참여 희망', no:'미희망', later:'나중에 결정', unknown:'미확인'};
+const DIFF_LABEL = {current_status:'현재상태', desired_job:'희망직무', phone:'휴대전화', email:'이메일', consent_marketing:'마케팅 수신', employment:'직장 추가', employment_end:'이전 직장 종료'};
+const diffVal = (f, v) => v == null || v === '' ? '(없음)' : f === 'current_status' ? (STATUS[v] || v) : f === 'consent_marketing' ? (v === true || v === 'true' ? '동의' : '미동의') : String(v);
+const diffShort = d => (d || []).map(x => DIFF_LABEL[x.field] || x.field).join(', ');
+st.sf = {cycle:'', tab:'new', seg:'all', status:'all', changed:'', q:'', old:''}; st.spage = 1; st.sel = new Set();
+st.lf = {q:'', link:'all', biz:'all'}; st.lpage = 1; st.lsel = new Set(); st.pc = null;
+const notLive = t => `<div class="head"><div><h1>${t}</h1><p>체험판에서는 사용할 수 없습니다. 실제 Supabase에 연결하면 열립니다.</p></div></div>`;
+
+async function surveysView(){
+  if(!store.live) return notLive('취업 현황 조사 관리');
+  const cycles = await store.cycles();
+  if(st.sf.cycle === '' && cycles.length) st.sf.cycle = String(cycles[0].id);
+  const r = await store.responses(st.sf, st.spage, 30); st.lastRespRows = r.rows; const f = st.sf; const canEdit = st.user.role !== 'viewer';
+  const cy = cycles.find(c => String(c.id) === String(f.cycle));
+  const answered = Object.values(r.by_status).reduce((a, b) => a + b, 0);
+  const tabs = [['new','새 응답'],['checked','확인 완료'],['pending_link','연결 대기'],['all','전체']];
+  return `<div class="head"><div><h1>취업 현황 조사 관리</h1><p>참여자가 제출한 응답은 승인 없이 바로 참여자 DB에 반영됩니다. 바뀐 항목을 확인하고, 잘못된 값은 참여자 상세정보 > 변경 이력에서 복구하세요.</p></div>
+    ${canEdit ? '<button class="btn" type="button" data-act="cycle-new">조사 회차 만들기</button>' : ''}</div>
+  <div class="panel"><div class="ph"><h2>조사 회차</h2><small>열린 회차는 하나만 둘 수 있습니다 · 4월·8월·12월 권장</small></div>
+    ${cycles.length ? `<div class="tw"><table class="grid"><thead><tr><th>회차</th><th>코드</th><th>응답 기간</th><th>상태</th><th>응답</th><th></th></tr></thead><tbody>
+    ${cycles.map(c => `<tr class="${String(c.id) === String(f.cycle) ? 'sel' : ''}"><td class="name"><button class="link" type="button" data-cycle="${c.id}">${E(c.title)}</button></td><td class="mono">${E(c.code || '')}</td>
+      <td class="num">${c.opens_at ? fmtD(c.opens_at) : '바로'} ~ ${c.closes_at ? fmtD(c.closes_at) : '닫을 때까지'}</td><td>${c.open_now ? '<span class="chip s-employed">응답 받는 중</span>' : c.is_open ? '<span class="chip s-seeking">기간 외</span>' : '<span class="chip s-other">닫힘</span>'}</td>
+      <td class="num">${fmtNum(c.responses)}명</td><td>${canEdit ? `<button class="btn ghost sm" type="button" data-cycle-edit="${c.id}">수정</button>` : ''}</td></tr>`).join('')}</tbody></table></div>`
+    : '<div class="empty">아직 만든 조사 회차가 없습니다. [조사 회차 만들기]로 시작하세요.</div>'}</div>
+  ${cy ? `<section class="kpis">
+    <div class="kpi"><span class="lbl">${E(cy.title)} 응답</span><strong>${fmtNum(answered)}명</strong><span class="sub">계정 연결 참여자 ${fmtNum(r.linked_total)}명 · 전체 참여자 ${fmtNum(r.active_total)}명</span></div>
+    <div class="kpi"><span class="lbl">구직자</span><strong>${fmtNum(r.by_seg.seeker || 0)}명</strong><span class="sub">구직 ${fmtNum(r.by_status.seeking || 0)} · 진학·교육 ${fmtNum(r.by_status.education || 0)} · 기타 ${fmtNum(r.by_status.other || 0)}</span></div>
+    <div class="kpi"><span class="lbl">재직자</span><strong>${fmtNum(r.by_seg.worker || 0)}명</strong><span class="sub">재직 ${fmtNum(r.by_status.employed || 0)} · 창업 ${fmtNum(r.by_status.startup || 0)}</span></div>
+    <button class="kpi attn" type="button" data-sf-changed="1"><span class="lbl">상태가 바뀐 응답</span><strong>${fmtNum(r.changed_n)}건</strong><span class="sub">예: 재직 중 → 구직 중 · 눌러서 보기</span></button>
+  </section>` : ''}
+  <div class="panel">
+    <div class="segs" role="tablist">${tabs.map(([k, l]) => `<button type="button" role="tab" class="seg ${f.tab === k ? 'on' : ''}" data-stab="${k}" aria-selected="${f.tab === k}">${l} <b>${fmtNum(r.tabs[k] || 0)}</b></button>`).join('')}</div>
+    <form class="toolbar" id="sfilters" role="search" style="margin-top:12px">
+      <input class="input search" name="q" placeholder="이름 · 관리번호" value="${E(f.q)}" aria-label="검색어">
+      <select class="select" name="cycle" aria-label="회차"><option value="all" ${f.cycle === 'all' ? 'selected' : ''}>모든 회차</option>${cycles.map(c => `<option value="${c.id}" ${String(c.id) === String(f.cycle) ? 'selected' : ''}>${E(c.title)}</option>`).join('')}</select>
+      <select class="select" name="seg" aria-label="구분"><option value="all">구직자·재직자 전체</option><option value="seeker" ${f.seg === 'seeker' ? 'selected' : ''}>구직자</option><option value="worker" ${f.seg === 'worker' ? 'selected' : ''}>재직자</option></select>
+      <select class="select" name="status" aria-label="현재 상태"><option value="all">전체 상태</option>${['seeking','employed','startup','education','other'].map(s => `<option value="${s}" ${f.status === s ? 'selected' : ''}>${STATUS[s]}</option>`).join('')}</select>
+      <select class="select" name="changed" aria-label="상태 변경"><option value="">상태 변경 여부 전체</option><option value="1" ${f.changed === '1' ? 'selected' : ''}>상태가 바뀐 응답만</option></select>
+      <select class="select" name="old" aria-label="이전 응답"><option value="">최신 응답만</option><option value="1" ${f.old === '1' ? 'selected' : ''}>고치기 전 응답 포함</option></select>
+      <button class="btn" type="submit">검색</button></form>
+    <div class="tablebar"><span class="count"><b>${fmtNum(r.total)}</b>건</span><div class="toolbar">
+      ${canEdit && f.tab !== 'checked' ? `<button class="btn ghost sm" type="button" data-act="resp-check" ${st.sel.size ? '' : 'disabled'}>선택 ${st.sel.size}건 확인 완료</button>` : ''}
+      <button class="btn sm" type="button" data-act="resp-export" ${r.total ? '' : 'disabled'}>엑셀 다운로드</button></div></div>
+    ${r.rows.length ? `<div class="tw"><table class="grid"><thead><tr>${canEdit ? '<th><input type="checkbox" data-sel-all aria-label="이 쪽 모두 선택"></th>' : ''}<th>제출일</th><th>관리번호</th><th>이름</th><th>현재 상태</th><th>반영된 항목</th><th>사후관리</th><th>필요 서비스</th><th>확인</th></tr></thead><tbody>
+    ${r.rows.map(x => `<tr data-resp="${x.id}">${canEdit ? `<td><input type="checkbox" data-sel="${x.id}" ${st.sel.has(x.id) ? 'checked' : ''} aria-label="선택"></td>` : ''}
+      <td class="num">${fmtDT(x.submitted_at)}${x.superseded_at ? ' <span class="tag">고치기 전</span>' : ''}</td>
+      <td class="code">${x.pcode ? `<button class="link" type="button" data-open="${x.participant_id}">${x.pcode}</button>` : '<span class="tag">연결 대기</span>'}</td>
+      <td class="name">${E(x.pname || x.respondent_name)}</td><td>${chip(x.reported_status)} <span class="tag">${SEG_LABEL[segOf(x.reported_status)]}</span>${x.status_changed ? ' <span class="badge b-dup">상태 변경</span>' : ''}</td>
+      <td>${x.apply_status === 'pending_link' ? '<span class="dim">연결되면 반영</span>' : E(diffShort(x.applied_diff) || '바뀐 항목 없음')}</td>
+      <td>${E(AFTER_LABEL[x.aftercare_intent] || '-')}</td><td>${E((x.desired_supports || []).slice(0, 2).join(', '))}${(x.desired_supports || []).length > 2 ? ` <span class="tag">외 ${x.desired_supports.length - 2}</span>` : ''}</td>
+      <td>${x.checked_at ? `<span class="dim">${fmtD(x.checked_at)}</span>` : '<span class="badge b-new">새 응답</span>'}</td></tr>`).join('')}</tbody></table></div>
+      ${pager(r.total, st.spage, 30, 'data-spage', '건')}` : '<div class="tw"><div class="empty">조건에 맞는 응답이 없습니다.</div></div>'}
+  </div>`;
+}
+function cycleModal(c){
+  const y = new Date().getFullYear(), m = new Date().getMonth() + 1; const next = [4, 8, 12].find(x => x >= m) || 4; const ny = next < m ? y + 1 : y;
+  c = c || {title:`${ny}년 ${next}월 취업 현황 조사`, code:`${ny}-${pad(next)}`, opens_at:`${ny}-${pad(next)}-01`, closes_at:'', is_open:false, policy_version:'v1'};
+  const dv = s => s ? String(s).slice(0, 10) : '';
+  modal(`<h3>${c.id ? '조사 회차 수정' : '조사 회차 만들기'}</h3><p>'응답 받기'를 켜면 참여자 페이지에 이 회차가 열립니다. 다른 회차는 자동으로 닫힙니다.</p>
+  <form id="cycleForm" novalidate data-cid="${c.id || ''}"><fieldset>
+    <div class="f wide"><label for="cy-title">회차 이름</label><input class="input" id="cy-title" name="title" value="${E(c.title)}"></div>
+    <div class="f"><label for="cy-code">회차 코드</label><input class="input" id="cy-code" name="code" value="${E(c.code || '')}" placeholder="2026-12"><span class="hint">변경 이력에 '2026-12 조사 응답'처럼 남습니다</span></div>
+    <div class="f"><label for="cy-policy">동의 문구 버전</label><input class="input" id="cy-policy" name="policy_version" value="${E(c.policy_version || 'v1')}"></div>
+    <div class="f"><label for="cy-open">시작일</label><input class="input" id="cy-open" name="opens_at" type="date" value="${dv(c.opens_at)}"></div>
+    <div class="f"><label for="cy-close">마감일(이 날 0시에 닫힘)</label><input class="input" id="cy-close" name="closes_at" type="date" value="${dv(c.closes_at)}"></div>
+    <div class="f wide"><label><input type="checkbox" name="is_open" value="1" ${c.is_open ? 'checked' : ''}> 응답 받기 (참여자 페이지에 열기)</label></div>
+  </fieldset><div id="cy-err" style="margin-top:8px"></div>
+  <div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="submit">저장</button></div></form>`);
+}
+function respModal(x){
+  const a = x.answers || {};
+  const row = (k, v) => v ? `<dt>${k}</dt><dd>${v}</dd>` : '';
+  modal(`<h3>${E(x.pname || x.respondent_name)} 응답 <span class="dim" style="font-size:13px">${fmtDT(x.submitted_at)} · ${E(x.cycle_title || '')}${x.version_no > 1 ? ` · ${x.version_no}번째 제출` : ''}</span></h3>
+  <dl class="kv" style="display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0 0 12px;font-size:13px">
+    ${row('현재 상태', `${STATUS[x.reported_status]}${a.status_other ? ` (${E(a.status_other)})` : ''}`)}${row('희망 직무', E((x.desired_jobs || []).join(', ')))}
+    ${row('현재 일자리', E([x.company, x.job_title, x.employment_type, x.start_date && fmtD(x.start_date), a.work_region].filter(Boolean).join(' · ')))}
+    ${row('관심 분야', E((a.interests || []).join(', ')))}${row('커리어 단계', E(x.career_stage))}${row('필요 서비스', E((x.desired_supports || []).join(', ')))}
+    ${row('사후관리', E(AFTER_LABEL[x.aftercare_intent] || ''))}${row('연락처', E([a.phone, a.email].filter(Boolean).join(' · ')))}
+    ${row('마케팅 수신', x.consent?.marketing == null ? '선택 안 함' : x.consent.marketing ? '동의' : '미동의')}${row('하고 싶은 말', E(a.comment))}
+  </dl>
+  ${x.apply_status === 'pending_link' ? '<div class="warnbox">계정이 아직 연결되지 않아 DB에 반영하지 않았습니다. 계정 연결에서 연결하면 바로 반영됩니다.</div>'
+    : (x.applied_diff || []).length ? `<div class="ph"><h2 style="font-size:14px">자동 반영된 항목</h2></div><ul style="margin:0 0 8px;padding-left:18px;font-size:13px">${x.applied_diff.map(d => `<li>${DIFF_LABEL[d.field] || d.field}: ${E(diffVal(d.field, d.old))} → ${E(diffVal(d.field, d.new))}</li>`).join('')}</ul><p style="font-size:12px;color:var(--sub);margin:0">잘못 반영된 값은 참여자 상세정보 > 변경 이력에서 [이전 값으로 복구]하세요.</p>` : '<p>바뀐 항목 없이 저장된 응답입니다.</p>'}
+  <div class="acts" style="margin-top:14px">${x.participant_id ? `<button class="btn ghost" type="button" data-open="${x.participant_id}">참여자 상세정보</button>` : ''}<button class="btn" type="button" data-act="modal-close">닫기</button></div>`);
+}
+async function exportResponses(){
+  const out = []; for(let page = 1; ; page++){ const r = await store.responses(st.sf, page, 1000); out.push(...r.rows); if(out.length >= r.total || !r.rows.length) break; }
+  const data = out.map(x => { const a = x.answers || {}; return {'제출일시':fmtDT(x.submitted_at), '회차':x.cycle_title || '', '관리번호':x.pcode || '(연결 대기)', '이름':x.pname || x.respondent_name, '현재 상태':STATUS[x.reported_status], '구분':SEG_LABEL[segOf(x.reported_status)],
+    '희망 직무':(x.desired_jobs || []).join(', '), '회사':x.company || '', '직무':x.job_title || '', '고용형태':x.employment_type || '', '입사일':x.start_date || '', '관심 분야':(a.interests || []).join(', '), '커리어 단계':x.career_stage || '',
+    '필요 서비스':(x.desired_supports || []).join(', '), '사후관리 희망':AFTER_LABEL[x.aftercare_intent] || '', '마케팅 수신':x.consent?.marketing == null ? '' : x.consent.marketing ? '동의' : '미동의',
+    '자동 반영 항목':x.apply_status === 'pending_link' ? '연결 대기' : diffShort(x.applied_diff), '상태 변경':x.status_changed ? 'Y' : '', '고치기 전 응답':x.superseded_at ? 'Y' : ''}; });
+  const ws = XLSX.utils.json_to_sheet(data); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '조사 응답');
+  const fn = `커리어링크_조사응답_${todayISO().replace(/-/g,'')}_${st.user.name}.xlsx`;
+  try{ XLSX.writeFile(wb, fn); toast(`${fmtNum(data.length)}건을 ${fn}로 내려받았습니다.`); }catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다.'); }
+}
+
+/* ---------- 계정 연결 ---------- */
+async function linksView(){
+  if(!store.live) return notLive('참여자 계정 연결');
+  const reqs = await store.linkRequests('pending'); const r = await store.accountStatus(st.lf, st.lpage, 50); const f = st.lf; const canEdit = st.user.role !== 'viewer';
+  const bizs = [...new Set(store.programs().map(bizOf))].sort((a, b) => a.localeCompare(b, 'ko'));
+  const state = x => x.linked_at ? `<span class="chip s-employed">연결됨</span> <span class="dim">${E(x.acc_email || '')} · ${fmtD(x.linked_at)}</span>`
+    : x.code_info && !x.code_info.used_at && !x.code_info.expired ? `<span class="chip s-seeking">코드 발급</span> <span class="dim">${fmtD(x.code_info.expires_at)}까지</span>`
+    : x.code_info && x.code_info.expired ? '<span class="chip s-other">코드 만료</span>' : '<span class="dim">미발급</span>';
+  return `<div class="head"><div><h1>참여자 계정 연결</h1><p>참여자 페이지 계정을 관리번호와 연결합니다. 이름·연락처가 같아도 자동으로 연결하지 않습니다. 연결 코드를 보내거나, 참여자가 보낸 연결 요청을 확인해 승인하세요.</p></div></div>
+  <div class="panel"><div class="ph"><h2>연결 요청 <span class="cnt">${reqs.length}</span></h2><small>연결 코드가 없는 참여자가 보낸 요청 · 후보는 휴대전화·이름+생년월일·이메일이 맞는 참여자</small></div>
+    ${reqs.length ? reqs.map(q => `<section class="dup" style="margin-bottom:12px"><div class="dt"><span><b>${E(q.name)}</b> · ${q.birth_date ? birthToYY(q.birth_date) : '-'} · ${E(q.phone || '-')} · ${E(q.email || '')}</span><span class="dim">${fmtDT(q.created_at)}</span></div>
+      <div style="padding:10px 16px;font-size:12.5px">${q.program_text ? `참여 프로그램(본인 입력): ${E(q.program_text)}` : ''}${q.message ? `<br>남긴 말: ${E(q.message)}` : ''}</div>
+      <div style="padding:0 16px 14px;display:flex;flex-direction:column;gap:8px">
+      ${q.candidates.length ? q.candidates.sort((a, b) => b.score - a.score).map(c => `<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid var(--line);border-radius:10px;padding:8px 12px">
+        <span><button class="link" type="button" data-open="${c.id}">${E(c.name)} ${c.code}</button> <span class="badge ${c.score >= 80 ? 'b-link' : 'b-dup'}">일치 ${c.score}점</span>${c.linked ? ' <span class="badge b-error">이미 다른 계정 연결</span>' : ''}${c.dup_n ? ` <span class="badge b-dup">중복 의심 ${c.dup_n}</span>` : ''}
+        <br><span class="dim">${c.birth_date ? birthToYY(c.birth_date) : '-'} · ${E(maskPhone(c.phone))} · ${E((c.programs || []).join(', '))}</span></span>
+        ${canEdit && !c.linked ? `<button class="btn sm" type="button" data-approve="${q.id}:${c.id}">이 참여자로 연결</button>` : ''}</div>`).join('') : '<div class="warnbox">DB에서 맞는 참여자를 찾지 못했습니다. 다른 연락처로 등록돼 있을 수 있으니 참여자 통합 DB에서 검색해 보세요.</div>'}
+      ${canEdit ? `<div class="toolbar"><button class="btn ghost sm" type="button" data-approve-new="${q.id}">새 참여자로 등록해 연결</button><button class="btn ghost sm" type="button" data-reject="${q.id}">반려</button></div>` : ''}</div></section>`).join('')
+    : '<div class="empty">확인할 연결 요청이 없습니다.</div>'}</div>
+  <div class="panel"><div class="ph"><h2>연결 코드 발급</h2><small>코드는 발급 직후에만 볼 수 있습니다 · 30일 유효 · 생년월일과 함께 입력해야 연결</small></div>
+    <div class="segs" role="tablist">${[['all','전체'],['linked','연결됨'],['code','코드 발급됨'],['none','미발급·만료']].map(([k, l]) => `<button type="button" class="seg ${f.link === k ? 'on' : ''}" data-lseg="${k}">${l}${r.counts[k] != null ? ` <b>${fmtNum(r.counts[k])}</b>` : ''}</button>`).join('')}</div>
+    <form class="toolbar" id="lfilters" role="search" style="margin-top:12px"><input class="input search" name="q" placeholder="이름 · 관리번호 · 휴대전화" value="${E(f.q)}" aria-label="검색어">
+      <select class="select" name="biz" aria-label="사업명"><option value="all">전체 사업</option>${bizs.map(b => `<option value="${E(b)}" ${f.biz === b ? 'selected' : ''}>${E(b)}</option>`).join('')}</select><button class="btn" type="submit">검색</button></form>
+    <div class="tablebar"><span class="count"><b>${fmtNum(r.total)}</b>명</span>${canEdit ? `<div class="toolbar"><button class="btn sm" type="button" data-act="issue-codes" ${st.lsel.size ? '' : 'disabled'}>선택 ${st.lsel.size}명 연결 코드 발급</button></div>` : ''}</div>
+    ${r.rows.length ? `<div class="tw"><table class="grid"><thead><tr>${canEdit ? '<th><input type="checkbox" data-lsel-all aria-label="이 쪽 모두 선택"></th>' : ''}<th>관리번호</th><th>이름</th><th>휴대전화</th><th>이메일</th><th>계정 연결</th></tr></thead><tbody>
+      ${r.rows.map(x => `<tr>${canEdit ? `<td>${x.linked_at ? '' : `<input type="checkbox" data-lsel="${x.id}" ${st.lsel.has(x.id) ? 'checked' : ''} aria-label="선택">`}</td>` : ''}<td class="code"><button class="link" type="button" data-open="${x.id}">${x.code}</button></td><td class="name">${E(x.name)}</td>
+      <td class="num">${E(maskPhone(x.phone))}</td><td>${E(x.email || '')}</td><td>${state(x)}</td></tr>`).join('')}</tbody></table></div>${pager(r.total, st.lpage, 50, 'data-lpage')}` : '<div class="tw"><div class="empty">조건에 맞는 참여자가 없습니다.</div></div>'}
+  </div>`;
+}
+function codesModal(list){
+  st.lastCodes = list; const ok = list.filter(x => x.link_code), skip = list.filter(x => x.skipped);
+  modal(`<h3>연결 코드 ${ok.length}건 발급</h3><p><b>코드는 지금 한 번만 보입니다.</b> 창을 닫기 전에 [발송용 엑셀 내려받기]로 저장해 문자·카카오톡으로 보내세요. 이전에 보낸 코드는 더 이상 쓸 수 없습니다.</p>
+  ${skip.length ? `<div class="warnbox">이미 계정이 연결된 ${skip.length}명은 건너뛰었습니다.</div>` : ''}
+  <div class="tw" style="max-height:320px"><table class="grid"><thead><tr><th>관리번호</th><th>이름</th><th>연결 코드</th><th>유효기간</th></tr></thead><tbody>${ok.map(x => `<tr><td class="code">${x.code}</td><td>${E(x.name)}</td><td class="mono"><b>${x.link_code}</b></td><td class="num">${fmtD(x.expires_at)}</td></tr>`).join('')}</tbody></table></div>
+  <div class="acts" style="margin-top:14px"><button class="btn" type="button" data-act="codes-export">발송용 엑셀 내려받기</button><button class="btn ghost" type="button" data-act="modal-close">닫기</button></div>`);
+}
+function exportCodes(){
+  const url = (CFG.PARTICIPANT_URL || '참여자 페이지 주소');
+  const data = (st.lastCodes || []).filter(x => x.link_code).map(x => ({'관리번호':x.code, '이름':x.name, '휴대전화':x.phone || '', '이메일':x.email || '', '연결 코드':x.link_code, '유효기간':fmtD(x.expires_at),
+    '안내 문구':`[오픈놀 커리어링크] ${x.name}님, 수료생 사후관리 페이지(${url})에 가입한 뒤 연결 코드 ${x.link_code}와 생년월일을 입력해 주세요. ${fmtD(x.expires_at)}까지 쓸 수 있습니다.`}));
+  const ws = XLSX.utils.json_to_sheet(data); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '연결 코드');
+  try{ XLSX.writeFile(wb, `커리어링크_연결코드_${todayISO().replace(/-/g,'')}.xlsx`); toast('발송용 엑셀을 내려받았습니다. 개인정보가 들어 있으니 발송 후 지워 주세요.'); }catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다.'); }
+}
+async function refreshPortalCounts(){
+  if(!store.portalCounts) return; let pc = null; try{ pc = await store.portalCounts(); }catch{ return; }
+  const same = JSON.stringify(pc) === JSON.stringify(st.pc); st.pc = pc;
+  if(!same){ const s = document.querySelector('.side'); if(s) s.outerHTML = sidebar(); }
+}
+document.addEventListener('click', async ev => {
+  const t = ev.target; let el;
+  if((el = t.closest('[data-cycle]'))){ st.sf.cycle = el.dataset.cycle; st.spage = 1; st.sel.clear(); return renderMain(); }
+  if((el = t.closest('[data-cycle-edit]'))){ const c = (await store.cycles()).find(x => x.id === +el.dataset.cycleEdit); return cycleModal(c); }
+  if((el = t.closest('[data-stab]'))){ st.sf.tab = el.dataset.stab; st.spage = 1; st.sel.clear(); return renderMain(); }
+  if((el = t.closest('[data-sf-changed]'))){ st.sf.changed = '1'; st.sf.tab = 'all'; st.spage = 1; return renderMain(); }
+  if((el = t.closest('[data-spage]'))){ st.spage = +el.dataset.spage; return renderMain(); }
+  if((el = t.closest('[data-lpage]'))){ st.lpage = +el.dataset.lpage; return renderMain(); }
+  if((el = t.closest('[data-lseg]'))){ st.lf.link = el.dataset.lseg; st.lpage = 1; st.lsel.clear(); return renderMain(); }
+  if(t.matches('[data-sel]')){ const id = +t.dataset.sel; t.checked ? st.sel.add(id) : st.sel.delete(id); const b = document.querySelector('[data-act="resp-check"]'); if(b){ b.disabled = !st.sel.size; b.textContent = `선택 ${st.sel.size}건 확인 완료`; } return; }
+  if(t.matches('[data-sel-all]')){ document.querySelectorAll('[data-sel]').forEach(c => { c.checked = t.checked; t.checked ? st.sel.add(+c.dataset.sel) : st.sel.delete(+c.dataset.sel); }); const b = document.querySelector('[data-act="resp-check"]'); if(b){ b.disabled = !st.sel.size; b.textContent = `선택 ${st.sel.size}건 확인 완료`; } return; }
+  if(t.matches('[data-lsel]')){ const id = +t.dataset.lsel; t.checked ? st.lsel.add(id) : st.lsel.delete(id); const b = document.querySelector('[data-act="issue-codes"]'); if(b){ b.disabled = !st.lsel.size; b.textContent = `선택 ${st.lsel.size}명 연결 코드 발급`; } return; }
+  if(t.matches('[data-lsel-all]')){ document.querySelectorAll('[data-lsel]').forEach(c => { c.checked = t.checked; t.checked ? st.lsel.add(+c.dataset.lsel) : st.lsel.delete(+c.dataset.lsel); }); const b = document.querySelector('[data-act="issue-codes"]'); if(b){ b.disabled = !st.lsel.size; b.textContent = `선택 ${st.lsel.size}명 연결 코드 발급`; } return; }
+  if((el = t.closest('tr[data-resp]')) && !t.closest('button,input,a')){ const x = (st.lastRespRows || []).find(y => y.id === +el.dataset.resp); if(x) respModal(x); return; }
+  if((el = t.closest('[data-approve]'))){ const [rq, pid] = el.dataset.approve.split(':').map(Number); try{ const r = await store.approveLink(rq, pid, false); toast(`${r.code}에 계정을 연결했습니다. 연결 전에 낸 조사 응답도 반영했습니다.`); }catch(e){ toast(e.message); } refreshPortalCounts(); return renderMain(); }
+  if((el = t.closest('[data-approve-new]'))){ try{ const r = await store.approveLink(+el.dataset.approveNew, null, true); toast(`새 참여자 ${r.code}로 등록하고 계정을 연결했습니다.`); }catch(e){ toast(e.message); } refreshPortalCounts(); return renderMain(); }
+  if((el = t.closest('[data-reject]'))){ return modal(`<h3>연결 요청 반려</h3><p>반려 사유는 참여자 페이지에 그대로 보입니다.</p><form id="rejectForm" data-rid="${el.dataset.reject}" novalidate><div class="f wide"><label for="rj-note">반려 사유</label><input class="input" id="rj-note" name="note" placeholder="예: 수료 기록을 찾을 수 없습니다. 담당자에게 연락해 주세요."></div><div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn danger" type="submit">반려</button></div></form>`); }
+  if((el = t.closest('[data-unlink]'))){ return modal(`<h3>계정 연결 해제</h3><p>참여자 페이지 계정과 이 관리번호의 연결을 끊습니다. 참여자 정보와 지난 응답은 그대로 남고, 변경 이력에 기록됩니다.</p><form id="unlinkForm" data-pid="${el.dataset.unlink}" novalidate><div class="f wide"><label for="ul-reason">해제 사유 *</label><input class="input" id="ul-reason" name="reason" placeholder="예: 다른 사람이 잘못 연결함"></div><div id="ul-err"></div><div class="acts" style="margin-top:14px"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn danger" type="submit">연결 해제</button></div></form>`); }
+  if((el = t.closest('[data-act]'))){
+    const a = el.dataset.act;
+    if(a === 'cycle-new') return cycleModal(null);
+    if(a === 'resp-export') return exportResponses();
+    if(a === 'resp-check'){ const n = await store.markChecked([...st.sel]); st.sel.clear(); toast(`${n}건을 확인 완료로 옮겼습니다.`); refreshPortalCounts(); return renderMain(); }
+    if(a === 'issue-codes'){ return modal(`<h3>연결 코드 ${st.lsel.size}명 발급</h3><p>이미 보낸 코드가 있으면 그 코드는 더 이상 쓸 수 없게 되고 새 코드가 발급됩니다. 계정이 연결된 참여자는 건너뜁니다.</p><div class="acts"><button class="btn ghost" type="button" data-act="modal-close">취소</button><button class="btn" type="button" data-act="issue-go">발급</button></div>`); }
+    if(a === 'issue-go'){ try{ const list = await store.issueCodes([...st.lsel], 30); st.lsel.clear(); codesModal(list); }catch(e){ closeModal(); toast(e.message); } return renderMain(); }
+    if(a === 'codes-export') return exportCodes();
+  }
+});
+document.addEventListener('change', ev => {
+  const form = ev.target.closest('form');
+  if(form?.id === 'sfilters' && ev.target.tagName === 'SELECT'){ st.sf[ev.target.name] = ev.target.value; st.spage = 1; st.sel.clear(); return renderMain(); }
+  if(form?.id === 'lfilters' && ev.target.tagName === 'SELECT'){ st.lf[ev.target.name] = ev.target.value; st.lpage = 1; st.lsel.clear(); return renderMain(); }
+});
+async function handlePortalForm(f, fd){
+  const g = k => String(fd.get(k) || '').trim();
+  if(f.id === 'sfilters'){ st.sf.q = g('q'); st.spage = 1; await renderMain(); return true; }
+  if(f.id === 'lfilters'){ st.lf.q = g('q'); st.lpage = 1; await renderMain(); return true; }
+  if(f.id === 'cycleForm'){
+    try{ const c = await store.saveCycle({id:f.dataset.cid || null, title:g('title'), code:g('code'), opens_at:g('opens_at') || null, closes_at:g('closes_at') || null, is_open:fd.get('is_open') === '1', policy_version:g('policy_version')});
+      closeModal(); st.sf.cycle = String(c.id); toast('조사 회차를 저장했습니다.'); await renderMain(); }
+    catch(e){ $('#cy-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; } return true;
+  }
+  if(f.id === 'rejectForm'){ try{ await store.rejectLink(+f.dataset.rid, g('note')); closeModal(); toast('연결 요청을 반려했습니다.'); refreshPortalCounts(); await renderMain(); }catch(e){ toast(e.message); } return true; }
+  if(f.id === 'unlinkForm'){ if(!g('reason')){ $('#ul-err').innerHTML = '<div class="issues">해제 사유를 입력하세요.</div>'; return true; }
+    try{ await store.unlinkAccount(+f.dataset.pid, g('reason')); closeModal(); st.detail = await store.get(st.detail.id); refreshDrawer(); toast('계정 연결을 해제했습니다.'); }catch(e){ $('#ul-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; } return true; }
+  return false;
 }
 
 /* ---------- 대시보드 ---------- */
 async function dashboardView(){
+  if(store.portalCounts && !st.pc) await refreshPortalCounts();
   const s = await store.stats();
   const workers = s.by.employed + s.by.startup;
   const rate = s.unique ? Math.round(workers / (s.unique - s.by.unknown || 1) * 100) : 0;
+  const pc = st.pc;
+  const portal = pc ? `<div class="panel" style="display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap"><span style="font-size:13px"><b>참여자 페이지</b> · 계정 연결 ${fmtNum(pc.linked)}명 · 확인할 조사 응답 <b>${fmtNum(pc.survey_new)}</b>건 · 연결 대기 응답 ${fmtNum(pc.survey_pending_link)}건 · 연결 요청 <b>${fmtNum(pc.link_pending)}</b>건</span>
+    <span class="toolbar"><button class="btn ghost sm" type="button" data-view="surveys">조사 응답 보기</button><button class="btn ghost sm" type="button" data-view="links">계정 연결</button></span></div>` : '';
   return `<div class="head"><div><h1>통합 대시보드</h1><p>${new Date().toLocaleDateString('ko-KR',{year:'numeric',month:'long',day:'numeric',weekday:'short'})} 기준 · 통합·삭제된 참여자는 제외</p></div>
     <button class="btn ghost" type="button" data-go-people="all">참여자 목록 보기</button></div>
   <section class="kpis">
@@ -1009,6 +1227,7 @@ async function dashboardView(){
     <button class="kpi" type="button" data-go-emp="seeking"><span class="lbl">구직 중</span><strong>${fmtNum(s.by.seeking)}명</strong><span class="sub">진학·교육 ${fmtNum(s.by.education)} · 기타 ${fmtNum(s.by.other)}</span></button>
     <button class="kpi attn" type="button" data-go-emp="unknown"><span class="lbl">미확인 · 확인 필요</span><strong>${fmtNum(s.by.unknown)}명</strong><span class="sub">전체의 ${s.unique ? Math.round(s.by.unknown/s.unique*100) : 0}% · 중복 의심 ${s.dups}쌍</span></button>
   </section>
+  ${portal}
   <section class="grid2">
     <div class="panel"><div class="ph"><h2>사업 연도별 참여 현황</h2><small>같은 해 여러 사업에 참여하면 인원은 1명, 건수는 여러 건</small></div>${yearChart(s.years)}</div>
     <div class="panel"><div class="ph"><h2>현재상태 분포</h2><small>${fmtNum(s.unique)}명</small></div>${statusStack(s.by, s.unique)}</div>
@@ -1146,7 +1365,7 @@ async function dupView_old(){
   return `<div class="head"><div><h1>중복 확인</h1><p>STEP 3에서 통합 기능을 구현합니다. 현재 가상 데이터에 이름·생년월일이 같은 의심 쌍이 ${s.dups}건 있습니다.</p></div></div>
   <div class="panel"><p style="margin:0;color:var(--sub);font-size:13px;line-height:1.7">판단 기준: 휴대전화 일치(100점) → 이메일 일치(90점) → 이름+생년월일 일치(70점) → 이름만 일치(30점, 참고). 자동 통합은 하지 않고, 관리자가 확인한 뒤 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고 다른 쪽은 '통합됨'으로 보존합니다. 참여자 상세 화면의 기본 정보 탭 상단에서도 의심 대상을 확인할 수 있습니다.</p></div>`;
 }
-const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가'};
+const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가', issue_link_codes:'연결 코드 발급', account_link:'계정 연결', account_unlink:'계정 연결 해제', link_reject:'연결 요청 반려', survey_cycle:'조사 회차 저장'};
 async function logsView(){
   const l = await store.auditLog();
   return `<div class="head"><div><h1>작업 기록</h1><p>로그인, 상세 조회, 수정, 다운로드가 자동으로 남습니다. 기록은 수정하거나 지울 수 없습니다. 최고관리자만 볼 수 있습니다.</p></div></div>
@@ -1273,15 +1492,26 @@ function fieldHTML(it){
 function drawer(){
   const p = st.detail; if(!p) return '';
   const dirty = dirtyKeys(); const statusChanged = dirty.includes('current_status');
-  const tabs = [['info','기본 정보'],['enroll',`사업 참여 ${p.enroll.length}`],['emp',`취업·창업 ${p.emps.length}`],['hist',`변경 이력 ${p.hist.length + p.chg.length}`]];
+  const tabs = [['info','기본 정보'],['enroll',`사업 참여 ${p.enroll.length}`],['emp',`취업·창업 ${p.emps.length}`],...(p.surveys ? [['survey',`조사 응답 ${p.surveys.filter(s => !s.superseded_at).length}`]] : []),['hist',`변경 이력 ${p.hist.length + p.chg.length}`]];
   let body = '';
   if(st.tab === 'info'){
     body = (p.dup.length ? `<div class="warnbox"><b>중복 의심 ${p.dup.length}건</b>${p.dup.map(d => `<div style="margin-top:6px"><button class="link" type="button" data-open="${d.other.id}">${E(d.other.name)} (${d.other.code})</button> · ${DUP_REASON[d.reason] || E(d.reason)}<br><span class="dim">상대 참여 사업: ${d.other.enroll.map(e => `${e.program.year} ${E(e.program.name)}`).join(', ') || '없음'}</span></div>`).join('')}<div style="margin-top:8px"><button class="btn ghost sm" type="button" data-dup-of="${p.code}">중복 확인에서 처리</button></div></div>` : '')
+      + (store.live && 'account' in p ? `<div class="${p.account ? 'okbox' : 'infobox'}" style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:12.5px">
+          <span><b>참여자 페이지 계정</b> · ${p.account ? `연결됨 (${E(p.account.email || '')} · ${fmtD(p.account.linked_at)} · ${p.account.linked_via === 'code' ? '연결 코드' : p.account.linked_via === 'request' ? '요청 승인' : '관리자'})` : p.link_code && !p.link_code.used_at ? `미연결 · 연결 코드 발급됨 (${fmtD(p.link_code.expires_at)}까지)` : '미연결'}${p.aftercare ? ` · 사후관리 ${AFTER_LABEL[p.aftercare.intent] || ''}` : ''}</span>
+          ${p.account && st.user.role !== 'viewer' ? `<button class="btn ghost sm" type="button" data-unlink="${p.id}">연결 해제</button>` : ''}</div>` : '')
       + FIELDS.map(g => `<fieldset><legend>${g.legend}</legend>${g.items.map(fieldHTML).join('')}</fieldset>`).join('')
       + (statusChanged ? `<div class="f wide"><label for="d-reason">상태 변경 사유 (이력에 남음)</label><input class="input" id="d-reason" data-reason value="${E(st.reason)}" placeholder="예: 10/28 전화 확인, 사후관리 설문 응답"></div>` : '');
   } else if(st.tab === 'enroll'){
     body = p.enroll.length ? p.enroll.map(e => `<div class="card"><div class="ct"><b>${E(e.program.name)}</b><span class="tag">${e.program.year}년</span></div><dl><dt>사업명</dt><dd>${E(bizOf(e.program))}</dd><dt>프로그램명</dt><dd>${E(e.program.prog_name || '-')}</dd><dt>기수</dt><dd>${E(e.program.cohort || '-')}</dd><dt>운영기간</dt><dd class="num">${fmtD(e.program.start_date)} ~ ${fmtD(e.program.end_date)}</dd><dt>수료일</dt><dd class="num">${fmtD(e.completion_date) || '-'}</dd><dt>참여 당시 유형</dt><dd>${E(e.entry_type || '-')}</dd></dl></div>`).join('') : '<div class="empty">사업 참여 이력이 없습니다.</div>';
     body = (st.user.role !== 'viewer' ? `<div class="ct" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">새 프로그램도 직접 입력해 추가할 수 있습니다. 여러 명은 엑셀 업로드를 이용하세요.</span><button class="btn sm" type="button" data-act="add-enroll">사업 참여 추가</button></div>` : '') + body;
+  } else if(st.tab === 'survey'){
+    const sv = p.surveys || [];
+    body = sv.length ? sv.map(s => `<div class="card ${s.superseded_at ? '' : 'cur'}"><div class="ct"><b>${E(s.cycle_title || '조사')}</b><span class="tag">${fmtDT(s.submitted_at)}</span>${s.superseded_at ? '<span class="tag">고치기 전 응답</span>' : ''}</div>
+      <dl><dt>현재 상태</dt><dd>${chip(s.reported_status)}</dd><dt>희망 직무</dt><dd>${E((s.desired_jobs || []).join(', ') || '-')}</dd><dt>현재 일자리</dt><dd>${E([s.company, s.job_title, s.employment_type].filter(Boolean).join(' · ') || '-')}</dd>
+      <dt>커리어 단계</dt><dd>${E(s.career_stage || '-')}</dd><dt>필요 서비스</dt><dd>${E((s.desired_supports || []).join(', ') || '-')}</dd><dt>사후관리</dt><dd>${E(AFTER_LABEL[s.aftercare_intent] || '-')}</dd>
+      <dt>마케팅 수신</dt><dd>${s.consent?.marketing == null ? '선택 안 함' : s.consent.marketing ? '동의' : '미동의'}</dd><dt>하고 싶은 말</dt><dd>${E(s.answers?.comment || '-')}</dd>
+      <dt>자동 반영</dt><dd>${s.apply_status === 'pending_link' ? '연결 대기' : (s.applied_diff || []).map(d => `${DIFF_LABEL[d.field] || d.field}: ${E(diffVal(d.field, d.old))} → ${E(diffVal(d.field, d.new))}`).join('<br>') || '바뀐 항목 없음'}</dd></dl></div>`).join('')
+      : '<div class="empty">아직 조사 응답이 없습니다.</div>';
   } else if(st.tab === 'emp'){
     body = `<div class="ct" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">새 직장을 등록하면 이전 직장은 종료일과 함께 이력으로 남습니다.</span><button class="btn sm" type="button" data-act="add-emp">취업·창업 등록</button></div>`
       + (p.emps.length ? p.emps.map(e => `<div class="card ${e.is_current ? 'cur' : ''}"><div class="ct"><b>${E(e.company || '(회사명 없음)')}</b>${e.is_current ? `<span class="chip s-${e.kind === 'startup' ? 'startup' : 'employed'}">${e.kind === 'startup' ? '창업 중' : '재직 중'}</span>` : '<span class="tag">종료</span>'}</div>
@@ -1297,7 +1527,7 @@ function drawer(){
   return `<div class="scrim" data-act="close"></div>
   <aside class="drawer" role="dialog" aria-modal="true" aria-label="${E(p.name)} 상세 정보">
     <div class="dh"><div class="t"><div><h2>${E(p.name)} ${chip(p.current_status)}</h2>
-      <div class="meta"><span class="mono">${p.code}</span><span>최초 등록 ${fmtD(p.created_at)}</span><span>최종 수정 ${fmtDT(p.updated_at)} · ${E(p.updated_by_name)}</span></div></div>
+      <div class="meta"><span class="mono">${p.code}</span><span>최초 등록 ${fmtD(p.created_at)}</span><span>최종 수정 ${fmtDT(p.updated_at)} · ${E(p.updated_by_name || '참여자 본인·시스템')}</span></div></div>
       <div class="toolbar">${st.user.role !== 'viewer' && !p.deleted_at ? '<button class="btn danger sm" type="button" data-act="del-person">삭제</button>' : ''}<button class="btn ghost sm" type="button" data-act="close" aria-label="닫기">닫기</button></div></div>
       <div class="tabs" role="tablist">${tabs.map(([k,l]) => `<button type="button" role="tab" data-tab="${k}" class="${st.tab === k ? 'on' : ''}" aria-selected="${st.tab === k}">${l}</button>`).join('')}</div></div>
     <div class="db" id="dbody">${body}</div>
@@ -1305,7 +1535,7 @@ function drawer(){
       <div class="toolbar"><button class="btn ghost" type="button" data-act="revert" title="저장 전 수정은 취소하고, 저장된 수정은 기록을 보고 복구합니다">되돌리기</button><button class="btn" type="button" data-act="save" ${dirty.length ? '' : 'disabled'}>저장</button></div></div>` : ''}
   </aside>`;
 }
-const SRC_LABEL = {admin:'직접 수정', upload:'엑셀 업로드', survey:'설문 반영', merge:'중복 통합', restore:'복구', system:'시스템', legacy:'기록'};
+const SRC_LABEL = {admin:'직접 수정', upload:'엑셀 업로드', survey:'설문 반영', participant:'참여자 본인', merge:'중복 통합', restore:'복구', system:'시스템', legacy:'기록'};
 const RESTORABLE = new Set(['name','birth_date','nationality','residence_sido','residence_gu','phone','email','school','major','graduation_year','education','desired_job','note','consent_marketing']);
 function histItems(p){
   const canEdit = st.user.role !== 'viewer';
@@ -1338,7 +1568,7 @@ async function doRestore(fd){
     st.detail = p; st.draft = draftFrom(p); st.errs = {}; st.reason = ''; refreshDrawer(); toast('이전 값으로 복구했습니다. 변경 이력에 복구 기록이 남았습니다.'); renderMain();
   }catch(e){ $('#rs-err').innerHTML = `<div class="issues">${E(e.message)}</div>`; }
 }
-const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', delete_reason:'삭제 사유', birth_year:'출생 연도', enrollment:'사업 참여 추가', consent_marketing:'마케팅 수신 동의'};
+const FIELD_LABEL = {name:'이름', birth_date:'생년월일', nationality:'국적', residence_sido:'거주지 시·도', residence_gu:'거주지 구·시·군', phone:'휴대전화', email:'이메일', school:'학교명', major:'전공', graduation_year:'졸업 연도', education:'학력', desired_job:'희망직무', note:'특이사항', consent_job_info:'취업정보 수신 동의(사용 중지)', merged_into_id:'통합 대상', delete_reason:'삭제 사유', birth_year:'출생 연도', enrollment:'사업 참여 추가', account:'참여자 계정 연결', employment:'취업 정보(조사)', employment_end:'이전 직장 종료', consent_marketing:'마케팅 수신 동의'};
 function fmtVal(f, v){ if(v == null) return ''; if(f === 'birth_date') return birthToYY(String(v)); if(f.startsWith('consent')) return v === true || v === 'true' ? '동의' : v === false || v === 'false' ? '미동의' : ''; return String(v); }
 function refreshDrawer(keepScroll = true){
   const old = document.querySelector('.drawer'); const sc = $('#dbody')?.scrollTop || 0; const focusId = document.activeElement?.id; const sel = document.activeElement?.selectionStart;
@@ -2014,7 +2244,7 @@ function confirmClose(next){
    동작
    ===================================================================== */
 async function openDetail(id){
-  const go = async () => { st.histSrc = 'all'; st.detail = await store.get(id); st.draft = draftFrom(st.detail); st.errs = {}; st.reason = ''; if(!['info','enroll','emp','hist'].includes(st.tab)) st.tab = 'info'; refreshDrawer(false); markSel(); };
+  const go = async () => { st.histSrc = 'all'; st.detail = await store.get(id); st.draft = draftFrom(st.detail); st.errs = {}; st.reason = ''; if(!['info','enroll','emp','survey','hist'].includes(st.tab)) st.tab = 'info'; refreshDrawer(false); markSel(); };
   if(st.detail && dirtyKeys().length) return confirmClose(go);
   go();
 }
@@ -2158,6 +2388,7 @@ document.addEventListener('input', ev => {
 });
 async function handleSubmit(f){
   const fd = new FormData(f);
+  if(await handlePortalForm(f, fd)) return;
   if(f.id === 'loginForm'){
     st.loginEmail = String(fd.get('email') || '');
     st.busy = true; st.loginErr = ''; render();
@@ -2197,7 +2428,7 @@ document.addEventListener('submit', async ev => {
   if(f.dataset.busy) return;
   f.dataset.busy = '1';
   const btns = [...f.querySelectorAll('button[type=submit]')];
-  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(!['filters','dupfilters','trashfilters','loginForm'].includes(f.id)) b.textContent = '처리 중…'; });
+  btns.forEach(b => { b.disabled = true; b.dataset.label = b.textContent; if(!['filters','dupfilters','trashfilters','sfilters','lfilters','loginForm'].includes(f.id)) b.textContent = '처리 중…'; });
   try{ await handleSubmit(f); }
   catch(e){ toast(e.message); }
   finally{ delete f.dataset.busy; if(f.isConnected) btns.forEach(b => { b.disabled = false; b.textContent = b.dataset.label; }); }
