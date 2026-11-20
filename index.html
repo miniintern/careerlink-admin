@@ -304,6 +304,10 @@ table.afm th[scope=row]{text-align:left;font-weight:600;white-space:nowrap}
 .afbar .n{font-size:12.5px;text-align:right;color:var(--sub)}
 .mchk{display:flex;gap:8px;align-items:flex-start;font-size:13px;cursor:pointer}.mchk input{margin-top:3px;accent-color:var(--accent)}
 .mextra{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line-strong);display:flex;flex-direction:column;gap:8px}.mextra .textarea{min-height:110px;font-size:12.5px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.svq{border:1px solid var(--line-strong);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;background:var(--surface)}.svq.map{border-left:4px solid var(--accent)}
+.svqh{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.svrow{display:flex;gap:16px;flex-wrap:wrap;align-items:center}.svlabels{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px}
+.svgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.svadd{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:12px;padding-top:12px;border-top:1px dashed var(--line-strong)}
+@media (max-width:900px){.svgrid{grid-template-columns:minmax(0,1fr)}}
 .mcount{margin-top:12px;display:flex;flex-direction:column;gap:3px;font-size:14px}.mcount small{color:var(--sub);font-size:12px}
 .mkind{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
 .mkind label{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line-strong);border-radius:10px;padding:10px 12px;font-size:13px;cursor:pointer}
@@ -892,11 +896,21 @@ function makeSupabaseStore(cfg){
     async rejectLink(id, note){ return rpc('reject_link_request', {req_id:id, note}); },
     async unlinkAccount(pid, reason){ return rpc('unlink_account', {pid, reason}); },
     async aftercare(f, page, size){ return rpc('list_aftercare', {f, page, size}); },
+    /* 설문 관리 */
+    async surveys(){ return rpc('list_surveys'); },
+    async getSurvey(cid){ return rpc('get_survey', {cid}); },
+    async saveSurvey(s){ return rpc('save_survey', {s}); },
+    async copySurvey(cid){ return rpc('copy_survey', {cid}); },
+    async surveyTargetCount(cid, f){ return rpc('survey_target_count', {cid, f}); },
+    async issueSurveyLinks(cid, f){ return rpc('issue_survey_links', {cid, f}); },
+    async surveyLinks(cid, f, page, size){ return rpc('list_survey_links', {cid, f, page, size}); },
+    async surveyAnswers(cid, f, page, size){ return rpc('list_survey_answers', {cid, f, page, size}); },
+    async revokeSurveyLink(id){ return rpc('revoke_survey_link', {link_id:id}); },
     async setIntent(pid, intent, reason){ return rpc('set_aftercare_intent', {pid, intent, reason: reason || null}); },
     async logExport(target, rows){ return audit('export_xlsx', target, {rows}); },
     /* 메일 보내기 */
     async mailList(page){ return rpc('mail_list', {page, size:30}); },
-    async mailPreview(f, ad, extra, useDb, extraOk){ return rpc('mail_preview', {f, is_ad:!!ad, extra:extra || [], use_db:useDb !== false, extra_ok:!!extraOk}); },
+    async mailPreview(f, ad, extra, useDb, extraOk, sid, pend){ return rpc('mail_preview', {f, is_ad:!!ad, extra:extra || [], use_db:useDb !== false, extra_ok:!!extraOk, survey_id:sid || null, pending_only:!!pend}); },
     async mailOptoutList(q){ return rpc('mail_optout_list', {q: q || null}); },
     async mailOptoutAdd(emails, reason){ return rpc('mail_optout_add', {emails, reason: reason || null}); },
     async mailOptoutRemove(email){ return rpc('mail_optout_remove', {email}); },
@@ -1032,7 +1046,7 @@ function sidebar(){
       ${nb('upload','엑셀 업로드')}
       ${nb('duplicates','중복 확인', st.dupCount ? `<span class="cnt">${st.dupCount}</span>` : '')}
       ${store.live ? `<div class="grp">참여자 페이지</div>
-      ${nb('surveys','취업 현황 조사', st.pc?.survey_new ? `<span class="cnt">${st.pc.survey_new}</span>` : '')}
+      ${nb('surveys','설문 관리')}
       ${nb('aftercare','사후관리 참여자')}
       ${nb('mail','메일 보내기', st.mailBusy ? '<span class="cnt">발송 중</span>' : '')}
       ${nb('links','계정 연결', st.pc?.link_pending ? `<span class="cnt">${st.pc.link_pending}</span>` : '')}` : ''}
@@ -1061,7 +1075,7 @@ async function renderMain(){
   else if(v === 'backup') m.innerHTML = await backupView();
   else if(v === 'logs') m.innerHTML = await logsView();
   else if(v === 'accounts') m.innerHTML = await accountsView();
-  else if(v === 'surveys') m.innerHTML = await surveysView();
+  else if(v === 'surveys') m.innerHTML = await svView();
   else if(v === 'links') m.innerHTML = await linksView();
   else if(v === 'aftercare') m.innerHTML = await aftercareView();
   else if(v === 'mail') m.innerHTML = await mailView();
@@ -1362,7 +1376,7 @@ const MAIL_ST = {ready:'대기', sending:'보내는 중', done:'완료', cancele
 const newMailTarget = () => ({scope:'all', year:'all', biz:'all', intent:'all', seg:'all', support:'all', job:'all', marketing:'all', linked:'', q:''});
 st.mail = {mode:'list', cid:null, page:1}; st.md = null; st.mprev = null; st.mailBusy = null; st.mailCur = null; st.mailStop = false;
 const newMailDraft = (target) => ({subject:'', body:'{{이름}}님, 안녕하세요.\n오픈놀 커리어성장사업부입니다.\n\n', is_ad:true, target:{...newMailTarget(), ...(target || {})}, testTo:st.user?.email || '',
-  use_db:true, extraText:'', extra:[], extraBad:[], extra_ok:false});
+  use_db:true, extraText:'', extra:[], extraBad:[], extra_ok:false, survey_id:null, survey_pending_only:false});
 // 직접 넣은 받는 사람: 한 줄에 한 명 (이름, 이메일 / 이메일만)
 function parseExtra(text){
   const out = [], bad = [];
@@ -1380,6 +1394,8 @@ function mailCountHtml(p, d){
   if(d.use_db) parts.push(`참여자 DB에서 ${fmtNum(p.from_db)}명 · 조건에 맞는 ${fmtNum(p.matched)}명 중 이메일 없음 ${fmtNum(p.no_email)}명${d.is_ad ? ` · 마케팅 수신 미동의·미선택 ${fmtNum(p.no_consent)}명` : ''} 제외`);
   if(p.extra_input) parts.push(`직접 추가 ${fmtNum(p.from_extra)}명 · ${fmtNum(p.extra_input)}줄 중 형식 오류·중복 ${fmtNum(p.extra_input - p.extra_valid)}줄${p.extra_in_db ? ` · 참여자 DB에 있는 주소 ${fmtNum(p.extra_in_db)}개` : ''}${p.extra_refused ? ` · DB에서 수신 거부한 ${fmtNum(p.extra_refused)}명 제외` : ''}${p.extra_blocked ? ` · <b style="color:var(--bad)">수신 동의 확인에 체크하지 않아 ${fmtNum(p.extra_blocked)}개 제외</b>` : ''}`);
   if(p.optout) parts.push(`수신 거부 목록에 있는 ${fmtNum(p.optout)}명 제외`);
+  if(p.survey_no_db) parts.push(`<b style="color:var(--warn)">참여자 DB에 없는 주소 ${fmtNum(p.survey_no_db)}개는 설문 링크를 만들 수 없어 제외</b>`);
+  if(p.survey_responded) parts.push(`이미 응답한 ${fmtNum(p.survey_responded)}명 제외`);
   if(d.use_db || p.extra_input) parts.push('같은 이메일은 한 번만 보냅니다');
   const bad = d.extraBad || [];
   return `<span>받는 사람 <b>${fmtNum(p.count)}</b>명</span>${parts.map(x => `<small>${x}</small>`).join('')}
@@ -1390,7 +1406,7 @@ let mailCountSeq = 0;
 async function refreshMailCount(){
   const d = st.md; if(!d) return; const seq = ++mailCountSeq;
   const px = parseExtra(d.extraText); d.extra = px.extra; d.extraBad = px.bad;
-  let p; try{ p = await store.mailPreview(d.target, d.is_ad, d.extra, d.use_db, d.extra_ok); }catch(e){ return toast(e.message); }
+  let p; try{ p = await store.mailPreview(d.target, d.is_ad, d.extra, d.use_db, d.extra_ok, d.survey_id, d.survey_pending_only); }catch(e){ return toast(e.message); }
   if(seq !== mailCountSeq) return; st.mprev = p;
   const box = $('#mail-count'); if(box) box.innerHTML = mailCountHtml(p, d);
   const go = $('[data-act="mail-go"]'); if(go){ go.disabled = !p.count; go.textContent = `${fmtNum(p.count)}명에게 보내기`; }
@@ -1447,8 +1463,9 @@ function mailHtml(src){
   const inline = s => {
     let h = E(s);
     h = h.replace(/!\[([^\]]*)\]\((https:\/\/[^\s)]+)\)/g, (m, alt, u) => `<img src="${u}" alt="${alt}" style="max-width:100%;height:auto;border:0;display:block;margin:8px 0">`);
-    h = h.replace(/\[버튼:\s*([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, t, u) => `<a href="${u}" style="display:inline-block;background:#5b4bdb;color:#ffffff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;margin:4px 0">${t}</a>`);
-    h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (m, t, u) => `<a href="${u}" style="${A}">${t}</a>`);
+    h = h.replace(/\[버튼:\s*([^\]]+)\]\((https?:\/\/[^\s)]+|\{\{조사링크\}\})\)/g, (m, t, u) => `<a href="${u}" style="display:inline-block;background:#5b4bdb;color:#ffffff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:600;margin:4px 0">${t}</a>`);
+    h = h.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|\{\{조사링크\}\})\)/g, (m, t, u) => `<a href="${u}" style="${A}">${t}</a>`);
+    h = h.replace(/(^|[\s(])\{\{조사링크\}\}/g, (m, p) => `${p}<a href="{{조사링크}}" style="${A}">{{조사링크}}</a>`);
     h = h.replace(/(^|[\s(])(https?:\/\/[^\s<]+)/g, (m, p, u) => `${p}<a href="${u}" style="${A}">${u}</a>`);
     h = h.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
     return h;
@@ -1471,7 +1488,7 @@ function mailPreviewBox(subject, body, isAd, name){
   const s = st.mailSettings || {};
   const foot = isAd ? `<hr style="border:none;border-top:1px solid #e5e5e5;margin:28px 0 12px"><p style="font-size:12px;line-height:1.6;color:#888;margin:0">${E(s.footer_ad || '').replace(/\n/g, '<br>')}</p>` : '';
   return `<div class="msubj"><span class="dim">제목</span> ${E((isAd ? '(광고) ' : '') + String(subject || '(제목 없음)').replaceAll('{{이름}}', nm))}<br><span class="dim">보내는 사람</span> ${E(s.sender_label || '')}</div>
-    <div class="mprev">${mailHtml(body).replaceAll('{{이름}}', E(nm))}${foot}</div>`;
+    <div class="mprev">${mailHtml(body).replaceAll('{{이름}}', E(nm)).replaceAll('{{조사링크}}', E((st.svUrl || 'https://…/survey.html') + '?t=(받는 사람별 링크)'))}${foot}</div>`;
 }
 const MAIL_HELP = `<details class="mhelp"><summary>서식 쓰는 법</summary><ul>
   <li><code>{{이름}}</code> → 받는 사람 이름 (제목에도 쓸 수 있음)</li><li>빈 줄 → 문단 나눔, 줄 바꿈은 그대로</li>
@@ -1496,13 +1513,14 @@ async function mailView(){
 }
 
 function mailTargetChips(t){
-  return [t.support !== 'all' && `서비스: ${t.support}`, t.job !== 'all' && `직무: ${t.job}`, t.q && `검색: ${t.q}`].filter(Boolean);
+  return [t.survey && `설문 링크를 받은 사람만: ${(st.svRows || []).find(x => String(x.id) === String(t.survey))?.title || '#' + t.survey}`, t.support !== 'all' && `서비스: ${t.support}`, t.job !== 'all' && `직무: ${t.job}`, t.q && `검색: ${t.q}`].filter(Boolean);
 }
 async function mailComposeView(){
   const d = st.md || (st.md = newMailDraft());
   if(!st.mailSettings){ const r = await store.mailList(1); st.mailSettings = r.settings; st.mailUsed = r.used_today; }
   const px = parseExtra(d.extraText); d.extra = px.extra; d.extraBad = px.bad;
-  const t = d.target; const p = st.mprev = await store.mailPreview(t, d.is_ad, d.extra, d.use_db, d.extra_ok);
+  if(!st.svRows) try{ await svList(); }catch{ st.svRows = []; }
+  const t = d.target; const p = st.mprev = await store.mailPreview(t, d.is_ad, d.extra, d.use_db, d.extra_ok, d.survey_id, d.survey_pending_only);
   const progs = store.programs(); const years = [...new Set(progs.map(x => x.year))].sort((a, b) => b - a);
   const bizs = [...new Set(progs.filter(x => t.year === 'all' || String(x.year) === String(t.year)).map(x => x.biz_name || x.name))].sort();
   const opt = (v, l, cur) => `<option value="${E(v)}" ${String(cur) === String(v) ? 'selected' : ''}>${E(l)}</option>`;
@@ -1528,6 +1546,12 @@ async function mailComposeView(){
       <textarea class="textarea" id="mail-extra" rows="5" aria-label="직접 추가할 받는 사람" placeholder="한 줄에 한 명씩 '이름, 이메일' (이메일만 써도 됩니다)&#10;홍길동, hong@example.com">${E(d.extraText)}</textarea>
       <small class="dim">엑셀은 이 브라우저 안에서만 읽고 따로 저장하지 않습니다. 첫 줄에 '이름', '이메일' 제목이 있으면 그 열을 씁니다. 직접 넣은 주소는 참여자 DB에 등록되지 않고 이 메일의 발송 명단에만 남습니다.</small>
       ${d.is_ad ? `<label class="mchk"><input type="checkbox" id="mail-extraok" ${d.extra_ok ? 'checked' : ''}><span>직접 넣은 주소는 <b>광고성 정보 수신 동의를 받은 주소</b>입니다. <small class="dim">체크하지 않으면 광고성 메일에서 빠집니다. 동의 기록은 따로 보관해 주세요.</small></span></label>` : ''}
+    </div>
+    <div class="mextra">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><b style="font-size:13.5px">설문 링크</b>
+        <select class="select" id="mail-survey" style="min-height:32px;padding:3px 8px" aria-label="설문 링크"><option value="">넣지 않음</option>${(st.svRows || []).filter(x => !x.legacy).map(x => `<option value="${x.id}" ${String(d.survey_id) === String(x.id) ? 'selected' : ''}>${E(x.title)}${x.open_now ? '' : ' (응답 받기 꺼짐)'}</option>`).join('')}</select>
+        ${d.survey_id ? `<label class="mchk"><input type="checkbox" id="mail-svpend" ${d.survey_pending_only ? 'checked' : ''}><span>아직 응답하지 않은 사람에게만</span></label><button class="btn ghost sm" type="button" data-act="mail-svinsert">본문에 '설문 참여하기' 버튼 넣기</button>` : ''}</div>
+      ${d.survey_id ? `<small class="dim">본문의 <code>{{조사링크}}</code>가 받는 사람마다 자기 링크로 바뀝니다. 링크가 없던 사람은 보낼 때 자동으로 만들어집니다. 참여자 DB에 없는 주소에는 보내지 않습니다.${(st.svRows || []).find(x => String(x.id) === String(d.survey_id))?.open_now ? '' : ' <b style="color:var(--warn)">이 설문은 지금 응답 받기가 꺼져 있습니다.</b>'}</small>` : ''}
     </div>
     <div class="mcount" id="mail-count">${mailCountHtml(p, d)}</div>
   </div>
@@ -1629,7 +1653,12 @@ document.addEventListener('click', async ev => {
   if((el = t.closest('[data-optout-del]'))){ if(!confirm(`${el.dataset.optoutDel}을(를) 수신 거부 목록에서 뺄까요?`)) return; try{ await store.mailOptoutRemove(el.dataset.optoutDel); await optoutModal(); }catch(e){ toast(e.message); } return; }
   if((el = t.closest('[data-act="mail-xtpl"]'))) return downloadExtraTemplate();
   if((el = t.closest('[data-act="mail-xclear"]'))){ st.md.extraText = ''; return renderMain(); }
-  if((el = t.closest('[data-act="mail-clear-extra"]'))){ Object.assign(st.md.target, {support:'all', job:'all', q:''}); return renderMain(); }
+  if((el = t.closest('[data-act="mail-clear-extra"]'))){ Object.assign(st.md.target, {support:'all', job:'all', q:'', survey:''}); return renderMain(); }
+  if((el = t.closest('[data-act="mail-svinsert"]'))){
+    const ta = $('#mail-body'), snip = '\n[버튼: 설문 참여하기]({{조사링크}})\n';
+    if(ta){ const a = ta.selectionStart ?? ta.value.length; ta.value = ta.value.slice(0, a) + snip + ta.value.slice(a); st.md.body = ta.value; const box = $('#mail-prev'); if(box) box.innerHTML = mailPreviewBox(st.md.subject, st.md.body, st.md.is_ad); }
+    return toast('본문에 설문 참여 버튼을 넣었습니다. 받는 사람마다 자기 링크로 바뀌어 나갑니다.');
+  }
   if((el = t.closest('[data-act="mail-go"]'))) return mailGoModal();
   if((el = t.closest('[data-act="mail-pause"]'))){ st.mailStop = true; el.disabled = true; el.textContent = '멈추는 중…'; return; }
   if((el = t.closest('[data-act="mail-resume"]'))) return runMailSend(st.mail.cid);
@@ -1640,7 +1669,8 @@ document.addEventListener('click', async ev => {
     if(!d.subject.trim() || !d.body.trim()) return toast('제목과 본문을 먼저 써 주세요.');
     if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(d.testTo)) return toast('테스트 받을 이메일 주소를 확인해 주세요.');
     el.disabled = true; el.textContent = '보내는 중…';
-    try{ const r = await store.mailTest({to:d.testTo, subject:d.subject, body_html:mailHtml(d.body), is_ad:d.is_ad}); toast(r.ok ? `${r.to}로 테스트 메일을 보냈습니다. 메일함(스팸함 포함)을 확인해 주세요.` : (r.error || '테스트 발송에 실패했습니다.')); st.mailUsed = (st.mailUsed || 0) + (r.ok ? 1 : 0); }
+    if(d.survey_id && !d.body.includes('{{조사링크}}')) return el.disabled = false, el.textContent = '테스트 발송', toast("설문을 골랐는데 본문에 {{조사링크}}가 없습니다. [본문에 '설문 참여하기' 버튼 넣기]를 눌러 주세요.");
+    try{ const r = await store.mailTest({to:d.testTo, subject:d.subject, body_html:mailHtml(d.body), is_ad:d.is_ad, survey_id:d.survey_id || null}); toast(r.ok ? `${r.to}로 테스트 메일을 보냈습니다. 메일함(스팸함 포함)을 확인해 주세요.` : (r.error || '테스트 발송에 실패했습니다.')); st.mailUsed = (st.mailUsed || 0) + (r.ok ? 1 : 0); }
     catch(e){ toast(e.message); }
     el.disabled = false; el.textContent = '테스트 발송'; return;
   }
@@ -1655,6 +1685,8 @@ document.addEventListener('input', ev => {
 document.addEventListener('change', ev => {
   if(st.view !== 'mail' || !st.md) return;
   if(ev.target.id === 'mail-usedb'){ st.md.use_db = ev.target.checked; return renderMain(); }
+  if(ev.target.id === 'mail-survey'){ st.md.survey_id = ev.target.value ? +ev.target.value : null; if(st.md.survey_id) st.md.survey_pending_only = true; return renderMain(); }
+  if(ev.target.id === 'mail-svpend'){ st.md.survey_pending_only = ev.target.checked; return refreshMailCount(); }
   if(ev.target.id === 'mail-extraok'){ st.md.extra_ok = ev.target.checked; return refreshMailCount(); }
   if(ev.target.id === 'mail-xlsx'){ const fl = ev.target.files?.[0]; ev.target.value = ''; if(fl) importExtraFile(fl).catch(e => toast('파일을 읽지 못했습니다: ' + e.message)); return; }
   if(ev.target.name === 'mail-ad'){ st.md.is_ad = ev.target.value === '1'; if(st.md.is_ad) st.md.target.marketing = 'all'; return renderMain(); }
@@ -1665,7 +1697,7 @@ async function handleMailForm(f, fd){
   if(f.id === 'mailGoForm'){
     const d = st.md; const btn = f.querySelector('[type=submit]'); btn.disabled = true; btn.textContent = '명단 만드는 중…';
     const px = parseExtra(d.extraText);
-    try{ const c = await store.mailCreate({subject:d.subject.trim(), body_src:d.body, body_html:mailHtml(d.body), is_ad:d.is_ad, target:d.target, use_db:d.use_db, extra:px.extra, extra_ok:d.is_ad && d.extra_ok}); closeModal(); st.md = null; runMailSend(c.id); }
+    try{ const c = await store.mailCreate({subject:d.subject.trim(), body_src:d.body, body_html:mailHtml(d.body), is_ad:d.is_ad, target:d.target, use_db:d.use_db, extra:px.extra, extra_ok:d.is_ad && d.extra_ok, survey_id:d.survey_id, survey_pending_only:d.survey_pending_only}); closeModal(); st.md = null; runMailSend(c.id); }
     catch(e){ btn.disabled = false; btn.textContent = '보내기 시작'; toast(e.message); }
     return true;
   }
@@ -1682,6 +1714,312 @@ async function handleMailForm(f, fd){
     return true;
   }
   return false;
+}
+
+/* ---------- 설문 관리 (14번 SQL): 문항 편집 · 개인별 링크 · 응답 ---------- */
+const SV_TYPES = {single:'하나 고르기', multi:'여러 개 고르기', short:'짧은 글', long:'긴 글', date:'날짜', scale:'점수', employment:'현재 일자리', contact:'연락처', consent:'개인정보 동의'};
+const SV_MAPS = {status:'현재 상태', desired_jobs:'희망 직무', employment:'현재 일자리', interests:'관심 분야', career_stage:'커리어 단계', supports:'필요 지원 서비스', aftercare:'사후관리 희망', contact:'연락처', consent:'개인정보 동의'};
+const SV_STATUS_LABELS = {seeking:'구직 중', employed:'재직 중', startup:'창업', education:'진학·교육 중', other:'기타'};
+const SV_AFTER_LABELS = {yes:'참여하겠습니다', no:'참여하지 않겠습니다', later:'나중에 결정하겠습니다'};
+const SV_POLICY = '수집 항목: 이 설문에서 답한 내용과 연락처\n이용 목적: 수료생 사후관리, 취업 현황 파악과 맞춤 서비스 안내, 사업 성과 집계(통계)\n보유 기간: 사내 검토 후 확정 예정 (임시 문구)\n동의하지 않으면 설문에 참여할 수 없습니다.';
+function svMapQ(m){
+  const q = {
+    status:      {type:'single', title:'현재 상태', required:true, options:['seeking','employed','startup','education','other'], labels:{...SV_STATUS_LABELS}},
+    desired_jobs:{type:'multi', title:'희망 직무', help:'최대 3개까지 골라 주세요', required:true, max:3, other:true, options:['마케팅·홍보','기획·PM','개발·데이터','디자인','경영지원·인사','영업·MD','교육·서비스']},
+    employment:  {type:'employment', title:'현재 일자리', help:'일하고 있다면 적어 주세요', required:false},
+    interests:   {type:'multi', title:'관심 분야·산업', help:'여러 개 고를 수 있어요', required:false, other:true, options:['IT·플랫폼','제조·생산','유통·커머스','금융·보험','교육','공공·비영리','미디어·콘텐츠','의료·바이오']},
+    career_stage:{type:'single', title:'현재 커리어 단계', required:true, options:['직무 탐색','취업 준비','입사 1년 미만','경력 1~3년','경력 3년 이상','이직 준비']},
+    supports:    {type:'multi', title:'필요한 지원 서비스', help:'여러 개 고를 수 있어요', required:true, other:true, options:['채용공고 큐레이션','맞춤 프로그램 안내','취업 컨설팅(서류·면접)','직장 적응 지원(온보딩 케어)','커리어 성장 로드맵','청년 정책 안내']},
+    aftercare:   {type:'single', title:'사후관리 참여 희망', help:'담당자가 정기적으로 연락해 취업·경력 고민을 함께 살핍니다. 마케팅 정보 수신과는 별개입니다.', required:true, options:['yes','no','later'], labels:{...SV_AFTER_LABELS}},
+    contact:     {type:'contact', title:'연락처 확인', help:'바뀌었다면 새 번호·이메일을 적어 주세요. 그대로면 비워 두셔도 됩니다.', required:false},
+    consent:     {type:'consent', title:'개인정보 수집·이용 동의', help:SV_POLICY, required:true, marketing:true},
+  }[m];
+  return {id:'q_' + m, map:m, ...JSON.parse(JSON.stringify(q))};
+}
+const svNewId = () => 'q' + Math.random().toString(36).slice(2, 8);
+function svTemplate(kind){
+  if(kind === 'employment') return ['status','desired_jobs','employment','interests','career_stage','supports','aftercare','contact'].map(svMapQ)
+    .concat([{id:'q_comment', type:'long', title:'하고 싶은 말', help:'건강, 종교, 가족 등 민감한 정보는 적지 말아 주세요', required:false}, svMapQ('consent')]);
+  return [svMapQ('consent')];
+}
+function svBlankQ(type){
+  const base = {id:svNewId(), type, title:'', help:'', required:false};
+  if(type === 'single' || type === 'multi') return {...base, options:['선택지 1', '선택지 2'], other:false};
+  if(type === 'scale') return {...base, min:1, max:5, scale_left:'전혀 아니다', scale_right:'매우 그렇다'};
+  return base;
+}
+const kstDate = ts => { if(!ts) return ''; const d = new Date(new Date(ts).getTime() + 9 * 3600e3); return d.toISOString().slice(0, 10); };
+const svStateOf = s => s.legacy ? ['이전 방식', ''] : s.open_now ? ['응답 받는 중', 'good'] : s.is_open && s.opens_at && new Date(s.opens_at) > new Date() ? ['시작 예정', ''] : s.is_open ? ['기간 종료', ''] : ['작성 중·닫힘', ''];
+function svAnswerText(q, v){
+  if(v == null || v === '') return '';
+  if(q.type === 'single'){
+    if(typeof v === 'object') return `${(q.labels || {})[v.v] || v.v} (${v.other})`;
+    return (q.labels || {})[v] || String(v);
+  }
+  if(q.type === 'multi') return (Array.isArray(v) ? v : []).join(', ');
+  if(q.type === 'scale') return `${v}점`;
+  if(q.type === 'employment') return [v.company, v.job_title, v.employment_type, v.start_date, v.work_region].filter(Boolean).join(' · ');
+  if(q.type === 'contact') return [v.phone, v.email].filter(Boolean).join(' · ');
+  if(q.type === 'consent') return `개인정보 동의${q.marketing ? ` · 마케팅 수신 ${v.marketing == null ? '선택 안 함' : v.marketing ? '동의' : '미동의'}` : ''}`;
+  return String(v);
+}
+
+st.sv = {mode:'list', id:null, tab:'questions', draft:null, cur:null, lf:{state:'all', q:''}, lpage:1, apage:1, target:newMailTarget(), tcount:null};
+const svList = async () => { const r = await store.surveys(); st.svUrl = r.survey_url; st.svRows = r.rows; return r; };
+
+async function svView(){
+  if(!store.live) return notLive('설문 관리');
+  if(st.svLegacy) return `<div style="margin-bottom:10px"><button class="btn ghost sm" type="button" data-act="sv-back-new">← 설문 관리로</button></div>` + await surveysView();
+  if(st.sv.mode !== 'list' && (st.sv.draft || st.sv.id)) return svDetailView();
+  const r = await svList(); const canEdit = st.user.role !== 'viewer';
+  const rows = r.rows.filter(x => !x.legacy), legacy = r.rows.filter(x => x.legacy);
+  return `<div class="head"><div><h1>설문 관리</h1><p>설문을 만들고, 참여자마다 개인 링크를 보내 응답을 받습니다. 'DB 반영 문항'의 응답은 참여자 DB에 바로 반영됩니다.</p></div>
+    ${canEdit ? '<button class="btn" type="button" data-act="sv-new">새 설문 만들기</button>' : ''}</div>
+  <div class="panel">${rows.length ? `<div class="tw"><table class="grid"><thead><tr><th>제목</th><th>구분</th><th>상태</th><th>기간</th><th class="num">링크</th><th class="num">응답</th><th class="num">응답률</th><th>만든 날</th></tr></thead><tbody>
+    ${rows.map(x => { const [sl, sc] = svStateOf(x); return `<tr data-sv="${x.id}"><td class="name">${E(x.title)}</td><td>${x.kind === 'employment' ? '<span class="tag">취업 현황 조사</span>' : '<span class="tag">일반 설문</span>'}</td>
+      <td><span class="tag" ${sc === 'good' ? 'style="background:var(--good-soft);color:var(--good)"' : ''}>${sl}</span></td><td class="num">${x.opens_at || x.closes_at ? `${kstDate(x.opens_at) || '바로'} ~ ${kstDate(x.closes_at) || '마감 없음'}` : '-'}</td>
+      <td class="num">${fmtNum(x.links)}</td><td class="num">${fmtNum(x.responded)}</td><td class="num">${x.links ? Math.round(x.responded / x.links * 100) + '%' : '-'}</td><td class="num">${fmtD(x.created_at)}</td></tr>`; }).join('')}</tbody></table></div>`
+    : `<div class="empty">아직 만든 설문이 없습니다. ${canEdit ? "[새 설문 만들기]에서 '취업 현황 조사 기본 틀'로 시작해 보세요." : ''}</div>`}</div>
+  ${legacy.length ? `<p style="font-size:12.5px;color:var(--sub)">이전 참여자 페이지(로그인 방식) 조사 ${legacy.length}건 · <button class="link" type="button" data-act="sv-legacy" style="border:0;background:none;color:var(--accent);cursor:pointer;padding:0;text-decoration:underline">이전 방식 조사 응답 보기</button></p>` : ''}`;
+}
+
+function svNewModal(){
+  modal(`<h3>새 설문 만들기</h3><p>어떻게 시작할까요? 만든 뒤에도 문항을 자유롭게 추가·수정할 수 있습니다.</p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="btn" type="button" data-sv-start="employment">취업 현황 조사 기본 틀로 시작 (10문항)</button>
+      <button class="btn ghost" type="button" data-sv-start="custom">빈 설문으로 시작 (개인정보 동의 문항만)</button>
+      <p style="font-size:12px;color:var(--sub);margin:4px 0 0">지난 설문을 그대로 다시 쓰려면 목록에서 설문을 연 뒤 [복사해서 새 설문]을 누르세요.</p>
+    </div><div class="acts"><button class="btn ghost" type="button" data-act="modal-close">닫기</button></div>`);
+}
+
+async function svDetailView(){
+  const s = st.sv;
+  if(s.id && (!s.cur || s.cur.id !== s.id)){ s.cur = await store.getSurvey(s.id); s.draft = JSON.parse(JSON.stringify(s.cur)); }
+  const c = s.cur, d = s.draft, isNew = !c;
+  const [sl, sc] = c ? svStateOf(c) : ['새 설문 (저장 전)', ''];
+  const tabs = [['questions','문항'], ['links','대상·링크'], ['answers','응답']];
+  let body = '';
+  if(s.tab === 'questions' || isNew) body = svEditor(d, c);
+  else if(s.tab === 'links') body = await svLinksTab(c);
+  else body = await svAnswersTab(c);
+  const canEdit = st.user.role !== 'viewer';
+  return `<div class="head"><div><h1>${E(d.title || '새 설문')}</h1><p><span class="tag" ${sc === 'good' ? 'style="background:var(--good-soft);color:var(--good)"' : ''}>${sl}</span>
+      ${c ? ` · 링크 ${fmtNum(c.links)}명 · 열어 봄 ${fmtNum(c.opened)}명 · 응답 ${fmtNum(c.responded)}명${c.links ? ` (${Math.round(c.responded / c.links * 100)}%)` : ''}` : ''}</p></div>
+    <span class="toolbar">${c ? `<button class="btn ghost" type="button" data-act="sv-preview">미리보기</button>` : ''}
+      ${c && canEdit ? `<button class="btn ghost" type="button" data-act="sv-toggle">${c.is_open ? '응답 받기 끄기' : '응답 받기 켜기'}</button><button class="btn ghost" type="button" data-act="sv-copy">복사해서 새 설문</button>` : ''}
+      <button class="btn ghost" type="button" data-act="sv-list">목록으로</button></span></div>
+  ${isNew ? '' : `<div class="tabs" role="tablist" style="display:flex;gap:6px;margin-bottom:12px">${tabs.map(([k, l]) => `<button type="button" class="btn ${s.tab === k ? '' : 'ghost'} sm" data-sv-tab="${k}">${l}</button>`).join('')}</div>`}
+  ${body}`;
+}
+
+function svEditor(d, c){
+  const locked = !!c?.locked, canEdit = st.user.role !== 'viewer';
+  const dis = canEdit ? '' : 'disabled';
+  const present = new Set(d.questions.map(q => q.map).filter(Boolean));
+  const qCard = (q, i) => {
+    const mapped = !!q.map, fixed = q.map === 'status' || q.map === 'aftercare';
+    const optBox = (q.type === 'single' || q.type === 'multi') ? (fixed
+      ? `<div class="f"><label>선택지 이름 <small class="dim">(DB 값과 연결되어 있어 이름만 바꿀 수 있습니다)</small></label><div class="svlabels">${q.options.map(o => `<input class="input" data-q="${i}" data-k="label:${o}" value="${E((q.labels || {})[o] || o)}" ${dis}>`).join('')}</div></div>`
+      : `<div class="f"><label>선택지 <small class="dim">한 줄에 하나씩${locked ? ' · 응답이 들어와 추가만 할 수 있습니다' : ''}</small></label><textarea class="textarea" rows="${Math.min(Math.max(q.options.length, 3), 10)}" data-q="${i}" data-k="options" ${dis}>${E(q.options.join('\n'))}</textarea></div>
+         <div class="svrow"><label class="mchk"><input type="checkbox" data-q="${i}" data-k="other" ${q.other ? 'checked' : ''} ${dis}><span>'기타(직접 입력)' 함께 보여 주기</span></label>
+         ${q.type === 'multi' ? `<label class="mchk">최대 <input class="input" style="width:64px;min-height:30px;padding:2px 6px" type="number" min="0" max="50" data-q="${i}" data-k="max" value="${q.max || ''}" ${dis}>개까지 <small class="dim">(비우면 제한 없음)</small></label>` : ''}</div>`) : '';
+    const scaleBox = q.type === 'scale' ? `<div class="svrow"><label class="mchk">점수 <input class="input" style="width:56px;min-height:30px;padding:2px 6px" type="number" min="0" max="1" data-q="${i}" data-k="min" value="${q.min ?? 1}" ${dis}> ~ <input class="input" style="width:56px;min-height:30px;padding:2px 6px" type="number" min="2" max="10" data-q="${i}" data-k="max" value="${q.max ?? 5}" ${dis}></label>
+      <label class="mchk">왼쪽 글 <input class="input" style="min-height:30px;padding:2px 8px" data-q="${i}" data-k="scale_left" value="${E(q.scale_left || '')}" ${dis}></label><label class="mchk">오른쪽 글 <input class="input" style="min-height:30px;padding:2px 8px" data-q="${i}" data-k="scale_right" value="${E(q.scale_right || '')}" ${dis}></label></div>` : '';
+    const fixedNote = {employment:'회사·기관명, 직무, 고용형태, 입사일, 근무지역을 묻습니다. 현재 상태가 재직·창업일 때만 보입니다.', contact:'휴대전화와 이메일을 묻습니다. 적은 경우에만 참여자 정보가 바뀝니다.',
+      consent:'[필수] 개인정보 수집·이용 동의를 받습니다. 모든 설문에 꼭 있어야 합니다.'}[q.type];
+    return `<div class="svq ${mapped ? 'map' : ''}">
+      <div class="svqh"><b>${i + 1}.</b> <span class="tag">${SV_TYPES[q.type]}</span>${mapped ? `<span class="tag" style="background:var(--accent-soft);color:var(--accent)">DB 반영 · ${SV_MAPS[q.map]}</span>` : ''}
+        <span style="flex:1"></span>${canEdit ? `<button class="btn ghost sm" type="button" data-sq-move="${i}:-1" ${i === 0 ? 'disabled' : ''} aria-label="위로">↑</button><button class="btn ghost sm" type="button" data-sq-move="${i}:1" ${i === d.questions.length - 1 ? 'disabled' : ''} aria-label="아래로">↓</button>
+        ${q.map === 'consent' || locked ? '' : `<button class="btn ghost sm" type="button" data-sq-del="${i}">빼기</button>`}` : ''}</div>
+      <div class="f"><label>문항</label><input class="input" data-q="${i}" data-k="title" value="${E(q.title)}" maxlength="300" ${dis}></div>
+      <div class="f"><label>${q.type === 'consent' ? '동의 안내 문구' : '설명 (선택)'}</label><textarea class="textarea" rows="${q.type === 'consent' ? 5 : 2}" data-q="${i}" data-k="help" ${dis}>${E(q.help || '')}</textarea></div>
+      ${optBox}${scaleBox}${fixedNote ? `<p class="dim" style="font-size:12px;margin:0">${fixedNote}</p>` : ''}
+      <div class="svrow">${q.type !== 'consent' ? `<label class="mchk"><input type="checkbox" data-q="${i}" data-k="required" ${q.required ? 'checked' : ''} ${dis}><span>필수</span></label>` : ''}
+        ${q.type === 'consent' ? `<label class="mchk"><input type="checkbox" data-q="${i}" data-k="marketing" ${q.marketing ? 'checked' : ''} ${dis}><span>[선택] 마케팅 정보 수신 동의도 함께 묻기</span></label>` : ''}</div>
+    </div>`;
+  };
+  const addable = Object.keys(SV_MAPS).filter(m => !present.has(m));
+  return `<div class="panel"><div class="ph"><h2>기본 정보</h2>${locked ? '<small style="color:var(--warn)">응답이 들어온 설문입니다. 문구 수정·선택지 추가만 할 수 있어요.</small>' : ''}</div>
+    <div class="svgrid">
+      <div class="f" style="grid-column:1/-1"><label for="sv-title">설문 제목</label><input class="input" id="sv-title" data-svf="title" value="${E(d.title || '')}" maxlength="120" placeholder="예: 2026년 12월 취업 현황 조사" ${dis}></div>
+      <div class="f" style="grid-column:1/-1"><label for="sv-desc">첫 화면 안내 문구 (선택)</label><textarea class="textarea" id="sv-desc" rows="3" data-svf="description" placeholder="예: 3분 정도 걸립니다. 응답해 주시면 맞춤 서비스를 안내해 드립니다." ${dis}>${E(d.description || '')}</textarea></div>
+      <div class="f"><label for="sv-open">시작일 <small class="dim">비우면 응답 받기를 켜는 즉시</small></label><input class="input" type="date" id="sv-open" data-svf="opens" value="${kstDate(d.opens_at)}" ${dis}></div>
+      <div class="f"><label for="sv-close">마감일 <small class="dim">그날 밤 11:59까지</small></label><input class="input" type="date" id="sv-close" data-svf="closes" value="${kstDate(d.closes_at)}" ${dis}></div>
+      <div class="f"><label for="sv-kind">구분</label><select class="select" id="sv-kind" data-svf="kind" ${dis}><option value="employment" ${d.kind === 'employment' ? 'selected' : ''}>취업 현황 조사</option><option value="custom" ${d.kind !== 'employment' ? 'selected' : ''}>일반 설문</option></select></div>
+    </div></div>
+  <div class="panel"><div class="ph"><h2>문항 ${d.questions.length}개</h2><small>'DB 반영' 문항의 응답은 참여자 DB에 바로 반영되고, 나머지는 응답 기록으로 저장됩니다</small></div>
+    <div style="display:flex;flex-direction:column;gap:10px">${d.questions.map(qCard).join('')}</div>
+    ${canEdit && !locked ? `<div class="svadd"><span class="dim" style="font-size:12.5px">문항 추가</span>${['single','multi','short','long','scale','date'].map(t => `<button class="btn ghost sm" type="button" data-sq-add="${t}">+ ${SV_TYPES[t]}</button>`).join('')}
+      ${addable.length ? `<select class="select" data-sq-addmap style="min-height:32px;padding:3px 8px"><option value="">+ DB 반영 문항</option>${addable.map(m => `<option value="${m}">${SV_MAPS[m]}</option>`).join('')}</select>` : ''}</div>` : ''}
+  </div>
+  ${canEdit ? `<div class="panel" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">저장한 뒤 [미리보기]로 참여자 화면을 확인하고, [대상·링크]에서 링크를 만드세요.</span>
+    <button class="btn" type="button" data-act="sv-save">저장</button></div>` : ''}`;
+}
+
+async function svLinksTab(c){
+  const s = st.sv, t = s.target, canEdit = st.user.role !== 'viewer';
+  const tc = s.tcount = await store.surveyTargetCount(c.id, t);
+  const r = await store.surveyLinks(c.id, s.lf, s.lpage, 50);
+  const progs = store.programs(); const years = [...new Set(progs.map(x => x.year))].sort((a, b) => b - a);
+  const bizs = [...new Set(progs.filter(x => t.year === 'all' || String(x.year) === String(t.year)).map(x => x.biz_name || x.name))].sort();
+  const opt = (v, l, cur) => `<option value="${E(v)}" ${String(cur) === String(v) ? 'selected' : ''}>${E(l)}</option>`;
+  const k = r.counts;
+  const stateLabel = x => x.revoked_at ? '<span class="dim">사용 중지</span>' : x.responded_at ? `<span style="color:var(--good)">응답 ${fmtD(x.responded_at)}</span>${x.response_count > 1 ? ` <span class="dim">(${x.response_count}번)</span>` : ''}` : x.first_opened_at ? '열어 봄' : '<span class="dim">안 열어 봄</span>';
+  return `${canEdit ? `<div class="panel"><div class="ph"><h2>링크 만들 대상</h2><small>참여자 DB에서 고릅니다 · 이미 링크가 있는 사람은 그대로 둡니다</small></div>
+    <form class="toolbar" id="svtarget">
+      <select class="select" name="scope">${opt('all','전체 참여자',t.scope)}${opt('resp','조사에 응답한 적 있는 참여자',t.scope)}</select>
+      <select class="select" name="year">${opt('all','사업 연도 전체',t.year)}${years.map(y => opt(y, y + '년', t.year)).join('')}</select>
+      <select class="select" name="biz">${opt('all','사업 전체',t.biz)}${bizs.map(b => opt(b, b, t.biz)).join('')}</select>
+      <select class="select" name="intent">${opt('all','사후관리 전체',t.intent)}${INTENTS.map(([v, l]) => opt(v, l, t.intent)).join('')}</select>
+      <select class="select" name="seg">${opt('all','구직자·재직자 전체',t.seg)}${SEGS.map(([v, l]) => opt(v, l, t.seg)).join('')}</select>
+      <select class="select" name="marketing">${opt('all','마케팅 수신 전체',t.marketing)}${opt('Y','동의',t.marketing)}${opt('N','미동의',t.marketing)}${opt('none','선택 안 함',t.marketing)}</select>
+    </form>
+    <div class="toolbar" style="margin-top:12px"><span style="font-size:14px">조건에 맞는 <b>${fmtNum(tc.matched)}</b>명 · 이미 링크 있음 ${fmtNum(tc.already)}명 · 이메일·휴대전화 모두 없음 ${fmtNum(tc.no_contact)}명</span><span style="flex:1"></span>
+      <button class="btn" type="button" data-act="sv-issue" ${tc.matched - tc.already > 0 ? '' : 'disabled'}>${fmtNum(tc.matched - tc.already)}명 링크 만들기</button></div></div>` : ''}
+  <div class="panel"><div class="ph"><h2>개인별 링크 ${fmtNum(k.all)}명</h2>
+    <span class="toolbar">${canEdit && k.all ? `<button class="btn ghost sm" type="button" data-act="sv-mail">메일로 안내하기</button>` : ''}<button class="btn ghost sm" type="button" data-act="sv-links-xlsx" ${k.all ? '' : 'disabled'}>링크 엑셀 (문자 발송용)</button></span></div>
+    <form class="toolbar" id="svlinkf" role="search">
+      ${[['all','전체',k.all],['pending','미응답',k.pending],['opened','열어 봤지만 미응답',k.opened],['responded','응답 완료',k.responded]].map(([v, l, n]) => `<button type="button" class="btn ${s.lf.state === v ? '' : 'ghost'} sm" data-svl-state="${v}">${l} ${fmtNum(n)}</button>`).join('')}
+      <span style="flex:1"></span><input class="input search" name="q" value="${E(s.lf.q)}" placeholder="이름 · 관리번호"><button class="btn ghost sm" type="submit">검색</button></form>
+    ${r.rows.length ? `<div class="tw"><table class="grid"><thead><tr><th>관리번호</th><th>이름</th><th>휴대전화</th><th>이메일</th><th>상태</th><th></th></tr></thead><tbody>
+      ${r.rows.map(x => `<tr><td class="code">${x.code}</td><td class="name">${E(x.name)}${x.deleted_at ? ' <span class="tag">삭제됨</span>' : ''}</td><td class="num">${E(maskPhone(x.phone))}</td><td>${E(x.email || '')}</td><td>${stateLabel(x)}</td>
+        <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" type="button" data-svl-copy="${x.token}">링크 복사</button>${canEdit && !x.revoked_at ? `<button class="btn ghost sm" type="button" data-svl-revoke="${x.id}" title="링크가 다른 사람에게 잘못 전달된 경우">사용 중지</button>` : ''}</td></tr>`).join('')}</tbody></table></div>
+      ${pager(r.total, s.lpage, 50, 'data-svl-page')}` : `<div class="empty">${k.all ? '조건에 맞는 링크가 없습니다.' : '아직 만든 링크가 없습니다. 위에서 대상을 고르고 [링크 만들기]를 누르세요.'}</div>`}
+    <p class="dim" style="font-size:12px;margin:10px 0 0">링크 주소: ${E(st.svUrl || c.survey_url)}?t=… · 링크를 아는 사람은 그 참여자로 응답할 수 있으니 본인에게만 보내 주세요. 잘못 보냈다면 [사용 중지] 후 새 설문으로 다시 보내세요.</p>
+  </div>`;
+}
+
+async function svAnswersTab(c){
+  const s = st.sv; const r = await store.surveyAnswers(c.id, {q:s.aq || ''}, s.apage, 50); st.svAnsRows = r.rows;
+  const qs = c.questions.filter(q => q.type !== 'consent').slice(0, 4);
+  return `<div class="panel"><div class="ph"><h2>응답 ${fmtNum(r.total)}건</h2><span class="toolbar"><button class="btn ghost sm" type="button" data-act="sv-ans-xlsx" ${r.total ? '' : 'disabled'}>응답 엑셀 다운로드</button></span></div>
+    <form class="toolbar" id="svansf" role="search"><input class="input search" name="q" value="${E(s.aq || '')}" placeholder="이름 · 관리번호"><button class="btn ghost sm" type="submit">검색</button></form>
+    ${r.rows.length ? `<div class="tw"><table class="grid"><thead><tr><th>관리번호</th><th>이름</th><th>제출</th>${qs.map(q => `<th>${E(q.title.length > 14 ? q.title.slice(0, 14) + '…' : q.title)}</th>`).join('')}<th>DB 반영</th></tr></thead><tbody>
+      ${r.rows.map((x, i) => `<tr data-sva="${i}"><td class="code">${E(x.code || '')}</td><td class="name">${E(x.name || '')}</td><td class="num">${fmtDT(x.submitted_at)}${x.version_no > 1 ? ` <span class="dim">(${x.version_no}번째)</span>` : ''}</td>
+        ${qs.map(q => `<td>${E(svAnswerText(q, (x.a || {})[q.id]).slice(0, 40))}</td>`).join('')}<td>${(x.applied_diff || []).length ? E(diffShort(x.applied_diff)) : '<span class="dim">변경 없음</span>'}</td></tr>`).join('')}</tbody></table></div>
+      ${pager(r.total, s.apage, 50, 'data-sva-page', '건')}` : '<div class="empty">아직 응답이 없습니다.</div>'}</div>`;
+}
+function svAnswerModal(x){
+  const c = st.sv.cur;
+  modal(`<h3>${E(x.name || '')} 응답 <span class="dim" style="font-size:13px">${fmtDT(x.submitted_at)}${x.version_no > 1 ? ` · ${x.version_no}번째 제출` : ''}</span></h3>
+    <dl style="display:grid;grid-template-columns:minmax(90px,auto) 1fr;gap:6px 14px;margin:0;font-size:13px;max-height:55vh;overflow:auto">
+    ${c.questions.map(q => `<dt style="color:var(--sub)">${E(q.title)}</dt><dd style="margin:0">${E(svAnswerText(q, (x.a || {})[q.id])) || '<span class="dim">-</span>'}</dd>`).join('')}</dl>
+    ${(x.applied_diff || []).length ? `<div style="font-size:12.5px"><b>참여자 DB에 반영된 항목</b><ul style="margin:4px 0 0;padding-left:18px">${x.applied_diff.map(d => `<li>${DIFF_LABEL[d.field] || d.field}: ${E(diffVal(d.field, d.old))} → ${E(diffVal(d.field, d.new))}</li>`).join('')}</ul></div>` : ''}
+    <div class="acts">${x.pid ? `<button class="btn ghost" type="button" data-sva-open="${x.pid}">참여자 상세정보</button>` : ''}<button class="btn" type="button" data-act="modal-close">닫기</button></div>`);
+}
+async function svExportLinks(){
+  const c = st.sv.cur, out = [];
+  for(let page = 1; ; page++){ const r = await store.surveyLinks(c.id, st.sv.lf, page, 1000); out.push(...r.rows); if(out.length >= r.total || !r.rows.length) break; }
+  const base = st.svUrl || c.survey_url;
+  const data = out.filter(x => !x.revoked_at).map(x => ({'관리번호':x.code, '이름':x.name, '휴대전화':x.phone || '', '이메일':x.email || '', '응답 여부':x.responded_at ? '응답' : '미응답', '응답일':x.responded_at ? fmtD(x.responded_at) : '', '설문 링크':`${base}?t=${x.token}`}));
+  const ws = XLSX.utils.json_to_sheet(data); ws['!cols'] = [{wch:11}, {wch:8}, {wch:14}, {wch:26}, {wch:8}, {wch:11}, {wch:70}];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '설문 링크');
+  const fn = `설문링크_${c.title.replace(/[\\/:*?"<>|]/g, '').slice(0, 30)}_${todayISO().replace(/-/g, '')}.xlsx`;
+  try{ XLSX.writeFile(wb, fn); toast(`${fmtNum(data.length)}명의 링크를 내려받았습니다. 개인 링크와 연락처가 있으니 발송 후 지워 주세요.`); }catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다.'); }
+  try{ await store.logExport?.('survey_links', data.length); }catch{}
+}
+async function svExportAnswers(){
+  const c = st.sv.cur, out = [];
+  for(let page = 1; ; page++){ const r = await store.surveyAnswers(c.id, {}, page, 1000); out.push(...r.rows); if(out.length >= r.total || !r.rows.length) break; }
+  const data = out.map(x => { const o = {'관리번호':x.code || '', '이름':x.name || '', '제출일시':fmtDT(x.submitted_at), '제출 횟수':x.version_no};
+    c.questions.forEach((q, i) => { o[`${i + 1}. ${q.title}`.slice(0, 80)] = svAnswerText(q, (x.a || {})[q.id]); });
+    o['DB 반영'] = (x.applied_diff || []).map(d => `${DIFF_LABEL[d.field] || d.field}: ${diffVal(d.field, d.old)} → ${diffVal(d.field, d.new)}`).join(' / ');
+    return o; });
+  const ws = XLSX.utils.json_to_sheet(data); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '응답');
+  const fn = `설문응답_${c.title.replace(/[\\/:*?"<>|]/g, '').slice(0, 30)}_${todayISO().replace(/-/g, '')}.xlsx`;
+  try{ XLSX.writeFile(wb, fn); toast(`${fmtNum(data.length)}건을 내려받았습니다.`); }catch{ toast('이 화면에서는 파일 저장이 막혀 있습니다.'); }
+  try{ await store.logExport?.('survey_answers', data.length); }catch{}
+}
+function svPayload(d, extra){
+  const opens = d._opens !== undefined ? d._opens : kstDate(d.opens_at), closes = d._closes !== undefined ? d._closes : kstDate(d.closes_at);
+  return {id:d.id || null, title:(d.title || '').trim(), description:d.description || '', kind:d.kind || 'custom',
+    opens_at: opens ? `${opens}T00:00:00+09:00` : null, closes_at: closes ? `${closes}T23:59:59+09:00` : null, is_open:!!d.is_open,
+    questions:d.questions.map(q => { const o = {...q}; if(o.options) o.options = o.options.map(x => String(x).trim()).filter(Boolean); if(o.max === '' || o.max == null) delete o.max; return o; }), ...(extra || {})};
+}
+async function svSave(extra){
+  const d = st.sv.draft; const bad = d.questions.findIndex(q => !String(q.title || '').trim());
+  if(!String(d.title || '').trim()) return toast('설문 제목을 입력하세요.'), false;
+  if(bad >= 0) return toast(`${bad + 1}번 문항 제목이 비어 있습니다.`), false;
+  try{ const r = await store.saveSurvey(svPayload(d, extra)); st.sv.cur = r; st.sv.id = r.id; st.sv.draft = JSON.parse(JSON.stringify(r)); return r; }
+  catch(e){ toast(e.message); return false; }
+}
+document.addEventListener('click', async ev => {
+  if(st.view !== 'surveys') return;
+  const t = ev.target; let el; const s = st.sv;
+  if((el = t.closest('[data-act="sv-legacy"]'))){ st.svLegacy = true; return renderMain(); }
+  if((el = t.closest('[data-act="sv-back-new"]'))){ st.svLegacy = false; return renderMain(); }
+  if(st.svLegacy) return;
+  if((el = t.closest('[data-sv]'))){ Object.assign(s, {mode:'detail', id:+el.dataset.sv, tab:'answers', cur:null, draft:null, lf:{state:'all', q:''}, lpage:1, apage:1, aq:''}); const row = (st.svRows || []).find(x => x.id === s.id); if(row && !row.responded) s.tab = row.links ? 'links' : 'questions'; return renderMain(); }
+  if((el = t.closest('[data-act="sv-new"]'))) return svNewModal();
+  if((el = t.closest('[data-sv-start]'))){ const k = el.dataset.svStart; closeModal(); Object.assign(s, {mode:'detail', id:null, cur:null, tab:'questions', draft:{title:k === 'employment' ? `${new Date().getFullYear()}년 ${new Date().getMonth() + 1}월 취업 현황 조사` : '', description:'', kind:k, is_open:false, questions:svTemplate(k)}}); return renderMain(); }
+  if((el = t.closest('[data-act="sv-list"]'))){ Object.assign(s, {mode:'list', id:null, cur:null, draft:null}); return renderMain(); }
+  if((el = t.closest('[data-sv-tab]'))){ s.tab = el.dataset.svTab; return renderMain(); }
+  if((el = t.closest('[data-act="sv-save"]'))){ el.disabled = true; const r = await svSave(); el.disabled = false; if(r){ toast('저장했습니다.'); renderMain(); } return; }
+  if((el = t.closest('[data-act="sv-preview"]'))){ const c = s.cur; window.open(`${st.svUrl || c.survey_url}?p=${c.preview_key}`, '_blank', 'noopener'); return; }
+  if((el = t.closest('[data-act="sv-toggle"]'))){
+    const c = s.cur, next = !c.is_open;
+    if(next && !confirm('응답 받기를 켤까요? 링크를 받은 사람이 바로 응답할 수 있습니다.')) return;
+    const r = await svSave({is_open:next}); if(!r) return;
+    toast(next ? (r.open_now ? '응답 받기를 켰습니다.' : r.opens_at && new Date(r.opens_at) > new Date() ? `${kstDate(r.opens_at)}부터 응답을 받습니다.` : '마감일이 지나 응답을 받지 않습니다. 마감일을 확인하세요.') : '응답 받기를 껐습니다.');
+    return renderMain();
+  }
+  if((el = t.closest('[data-act="sv-copy"]'))){ if(!confirm('이 설문의 문항을 그대로 복사해 새 설문을 만들까요? (링크·응답은 복사되지 않습니다)')) return; try{ const r = await store.copySurvey(s.cur.id); Object.assign(s, {id:r.id, cur:r, draft:JSON.parse(JSON.stringify(r)), tab:'questions'}); toast('복사했습니다. 제목과 기간을 고친 뒤 저장하세요.'); }catch(e){ toast(e.message); } return renderMain(); }
+  if((el = t.closest('[data-sq-add]'))){ s.draft.questions.splice(s.draft.questions.length - (s.draft.questions.at(-1)?.map === 'consent' ? 1 : 0), 0, svBlankQ(el.dataset.sqAdd)); return renderMain(); }
+  if((el = t.closest('[data-sq-del]'))){ const i = +el.dataset.sqDel, q = s.draft.questions[i]; if(q.map && !confirm(`'${SV_MAPS[q.map]}'은(는) DB 반영 문항입니다. 빼면 이 설문에서는 해당 정보가 참여자 DB에 반영되지 않습니다. 뺄까요?`)) return; s.draft.questions.splice(i, 1); return renderMain(); }
+  if((el = t.closest('[data-sq-move]'))){ const [i, dlt] = el.dataset.sqMove.split(':').map(Number); const a = s.draft.questions; const j = i + dlt; if(j < 0 || j >= a.length) return; [a[i], a[j]] = [a[j], a[i]]; return renderMain(); }
+  if((el = t.closest('[data-act="sv-issue"]'))){
+    const n = s.tcount.matched - s.tcount.already; if(!confirm(`${fmtNum(n)}명에게 이 설문의 개인 링크를 만들까요?`)) return;
+    el.disabled = true; try{ const r = await store.issueSurveyLinks(s.cur.id, s.target); s.cur = {...s.cur, ...r}; toast(`${fmtNum(r.created)}명의 링크를 만들었습니다. [메일로 안내하기] 또는 [링크 엑셀]로 보내세요.`); }catch(e){ toast(e.message); }
+    return renderMain();
+  }
+  if((el = t.closest('[data-svl-state]'))){ s.lf.state = el.dataset.svlState; s.lpage = 1; return renderMain(); }
+  if((el = t.closest('[data-svl-page]'))){ s.lpage = +el.dataset.svlPage; return renderMain(); }
+  if((el = t.closest('[data-sva-page]'))){ s.apage = +el.dataset.svaPage; return renderMain(); }
+  if((el = t.closest('[data-svl-copy]'))){ const u = `${st.svUrl || s.cur.survey_url}?t=${el.dataset.svlCopy}`; try{ await navigator.clipboard.writeText(u); toast('링크를 복사했습니다. 본인에게만 보내 주세요.'); }catch{ prompt('아래 링크를 복사하세요.', u); } return; }
+  if((el = t.closest('[data-svl-revoke]'))){ if(!confirm('이 링크를 사용 중지할까요? 이 링크로는 더 이상 응답할 수 없습니다.')) return; try{ await store.revokeSurveyLink(+el.dataset.svlRevoke); toast('링크를 사용 중지했습니다.'); }catch(e){ toast(e.message); } return renderMain(); }
+  if((el = t.closest('[data-act="sv-links-xlsx"]'))) return svExportLinks();
+  if((el = t.closest('[data-act="sv-ans-xlsx"]'))) return svExportAnswers();
+  if((el = t.closest('[data-sva-open]'))){ closeModal(); return openDetail?.(+el.dataset.svaOpen); }
+  if((el = t.closest('[data-sva]'))) return svAnswerModal(st.svAnsRows[+el.dataset.sva]);
+  if((el = t.closest('[data-act="sv-mail"]'))){
+    const c = s.cur;
+    st.md = newMailDraft({survey:String(c.id)}); Object.assign(st.md, {is_ad:false, survey_id:c.id, survey_pending_only:true,
+      subject:`[오픈놀] ${c.title} 참여 안내`,
+      body:`{{이름}}님, 안녕하세요.\n오픈놀 커리어성장사업부입니다.\n\n${c.title}에 참여해 주세요. 3분 정도 걸립니다.\n응답해 주시면 지금 상황에 맞는 서비스를 안내해 드리겠습니다.\n\n[버튼: 설문 참여하기]({{조사링크}})\n\n위 버튼은 ${'{{이름}}'}님 전용 링크입니다. 다른 분께 전달하지 말아 주세요.${c.closes_at ? `\n응답 마감: ${kstDate(c.closes_at)}` : ''}`});
+    st.mail = {mode:'compose', cid:null, page:1}; return setView('mail');
+  }
+});
+document.addEventListener('input', ev => {
+  if(st.view !== 'surveys' || !st.sv.draft) return;
+  const t = ev.target, d = st.sv.draft;
+  if(t.dataset.svf){ const k = t.dataset.svf; if(k === 'opens') d._opens = t.value; else if(k === 'closes') d._closes = t.value; else d[k] = t.value; if(k === 'title'){ const h = $('#main .head h1'); if(h) h.textContent = t.value || '새 설문'; } return; }
+  if(t.dataset.q !== undefined){
+    const q = d.questions[+t.dataset.q], k = t.dataset.k;
+    if(k.startsWith('label:')) (q.labels = q.labels || {})[k.slice(6)] = t.value;
+    else if(k === 'options') q.options = t.value.split('\n');
+    else if(['required','other','marketing'].includes(k)) q[k] = t.checked;
+    else if(['max','min'].includes(k)) q[k] = t.value === '' ? '' : +t.value;
+    else q[k] = t.value;
+  }
+});
+document.addEventListener('change', ev => {
+  if(st.view !== 'surveys') return;
+  const t = ev.target;
+  if(t.matches?.('[data-sq-addmap]') && t.value){ const d = st.sv.draft; d.questions.splice(d.questions.length - (d.questions.at(-1)?.map === 'consent' ? 1 : 0), 0, svMapQ(t.value)); return renderMain(); }
+  if(t.dataset?.q !== undefined && t.type === 'checkbox') return;   // input 이벤트에서 처리
+  if(t.closest('form')?.id === 'svtarget'){ st.sv.target[t.name] = t.value; if(t.name === 'year') st.sv.target.biz = 'all'; return renderMain(); }
+});
+async function handleSurveyForm(f, fd){
+  if(f.id === 'svlinkf'){ st.sv.lf.q = String(fd.get('q') || '').trim(); st.sv.lpage = 1; await renderMain(); return true; }
+  if(f.id === 'svansf'){ st.sv.aq = String(fd.get('q') || '').trim(); st.sv.apage = 1; await renderMain(); return true; }
+  if(f.id === 'svtarget') return true;
+  return false;
+}
+// 참여자 상세 '조사 응답' 탭에서 링크 설문 응답 보기
+document.addEventListener('click', ev => { const el = ev.target.closest('[data-sv-resp]'); if(!el) return; const s = (st.detail?.surveys || []).find(x => String(x.id) === el.dataset.svResp); if(s) svOpenResponse(s.cycle_id, s); });
+async function svOpenResponse(cycleId, resp){
+  try{ const c = await store.getSurvey(cycleId); const prev = st.sv.cur; st.sv.cur = c; svAnswerModal({name:st.detail?.name, submitted_at:resp.submitted_at, version_no:resp.version_no, a:resp.answers?.q || {}, applied_diff:resp.applied_diff}); st.sv.cur = prev; }
+  catch(e){ toast(e.message); }
 }
 
 /* ---------- 대시보드 ---------- */
@@ -1839,7 +2177,7 @@ async function dupView_old(){
   return `<div class="head"><div><h1>중복 확인</h1><p>STEP 3에서 통합 기능을 구현합니다. 현재 가상 데이터에 이름·생년월일이 같은 의심 쌍이 ${s.dups}건 있습니다.</p></div></div>
   <div class="panel"><p style="margin:0;color:var(--sub);font-size:13px;line-height:1.7">판단 기준: 휴대전화 일치(100점) → 이메일 일치(90점) → 이름+생년월일 일치(70점) → 이름만 일치(30점, 참고). 자동 통합은 하지 않고, 관리자가 확인한 뒤 남길 쪽을 고르면 참여·취업·상태 이력을 모두 옮기고 다른 쪽은 '통합됨'으로 보존합니다. 참여자 상세 화면의 기본 정보 탭 상단에서도 의심 대상을 확인할 수 있습니다.</p></div>`;
 }
-const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가', issue_link_codes:'연결 코드 발급', account_link:'계정 연결', account_unlink:'계정 연결 해제', link_reject:'연결 요청 반려', survey_cycle:'조사 회차 저장', aftercare_intent:'사후관리 희망 변경', mail_create:'메일 발송 시작', mail_test:'테스트 메일', mail_cancel:'메일 발송 중단', mail_retry:'메일 재발송', mail_settings:'발송 설정 변경', mail_optout_add:'수신 거부 추가', mail_optout_remove:'수신 거부 삭제'};
+const ACTION = {login:'로그인', logout:'로그아웃', view_participant:'상세 조회', update_participant:'정보 수정', export_xlsx:'엑셀 다운로드', upload_stage:'업로드 검사', upload_commit:'업로드 확정', upload_revert:'업로드 되돌리기', merge:'중복 통합', dismiss_duplicate:'다른 사람 처리', backup_export:'전체 백업', password_change:'비밀번호 변경', create_participant:'참여자 등록', add_employment:'취업 등록', end_employment:'퇴사 처리', admin_register:'관리자 등록', admin_active:'관리자 사용 변경', restore_change:'이전 값 복구', delete_participant:'참여자 삭제', undelete_participant:'삭제 취소', purge_participant:'영구 삭제', add_enrollment:'사업 참여 추가', issue_link_codes:'연결 코드 발급', account_link:'계정 연결', account_unlink:'계정 연결 해제', link_reject:'연결 요청 반려', survey_cycle:'조사 회차 저장', aftercare_intent:'사후관리 희망 변경', mail_create:'메일 발송 시작', mail_test:'테스트 메일', mail_cancel:'메일 발송 중단', mail_retry:'메일 재발송', mail_settings:'발송 설정 변경', mail_optout_add:'수신 거부 추가', mail_optout_remove:'수신 거부 삭제', survey_save:'설문 저장', survey_copy:'설문 복사', survey_links:'설문 링크 만들기', survey_links_view:'설문 링크 조회', survey_link_revoke:'설문 링크 사용 중지'};
 async function logsView(){
   const l = await store.auditLog();
   return `<div class="head"><div><h1>작업 기록</h1><p>로그인, 상세 조회, 수정, 다운로드가 자동으로 남습니다. 기록은 수정하거나 지울 수 없습니다. 최고관리자만 볼 수 있습니다.</p></div></div>
@@ -1980,7 +2318,9 @@ function drawer(){
     body = (st.user.role !== 'viewer' ? `<div class="ct" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-size:13px;color:var(--sub)">새 프로그램도 직접 입력해 추가할 수 있습니다. 여러 명은 엑셀 업로드를 이용하세요.</span><button class="btn sm" type="button" data-act="add-enroll">사업 참여 추가</button></div>` : '') + body;
   } else if(st.tab === 'survey'){
     const sv = p.surveys || [];
-    body = sv.length ? sv.map(s => `<div class="card ${s.superseded_at ? '' : 'cur'}"><div class="ct"><b>${E(s.cycle_title || '조사')}</b><span class="tag">${fmtDT(s.submitted_at)}</span>${s.superseded_at ? '<span class="tag">고치기 전 응답</span>' : ''}</div>
+    body = sv.length ? sv.map(s => s.answers?.q ? `<div class="card ${s.superseded_at ? '' : 'cur'}"><div class="ct"><b>${E(s.cycle_title || '설문 응답')}</b><span class="tag">${fmtDT(s.submitted_at)}</span>${s.superseded_at ? '<span class="tag">고치기 전 응답</span>' : ''}</div>
+      <dl><dt>자동 반영</dt><dd>${(s.applied_diff || []).map(d => `${DIFF_LABEL[d.field] || d.field}: ${E(diffVal(d.field, d.old))} → ${E(diffVal(d.field, d.new))}`).join('<br>') || '바뀐 항목 없음'}</dd></dl>
+      <button class="btn ghost sm" type="button" data-sv-resp="${s.id}">응답 전체 보기</button></div>` : `<div class="card ${s.superseded_at ? '' : 'cur'}"><div class="ct"><b>${E(s.cycle_title || '조사')}</b><span class="tag">${fmtDT(s.submitted_at)}</span>${s.superseded_at ? '<span class="tag">고치기 전 응답</span>' : ''}</div>
       <dl><dt>현재 상태</dt><dd>${chip(s.reported_status)}</dd><dt>희망 직무</dt><dd>${E((s.desired_jobs || []).join(', ') || '-')}</dd><dt>현재 일자리</dt><dd>${E([s.company, s.job_title, s.employment_type].filter(Boolean).join(' · ') || '-')}</dd>
       <dt>커리어 단계</dt><dd>${E(s.career_stage || '-')}</dd><dt>필요 서비스</dt><dd>${E((s.desired_supports || []).join(', ') || '-')}</dd><dt>사후관리</dt><dd>${E(AFTER_LABEL[s.aftercare_intent] || '-')}</dd>
       <dt>마케팅 수신</dt><dd>${s.consent?.marketing == null ? '선택 안 함' : s.consent.marketing ? '동의' : '미동의'}</dd><dt>하고 싶은 말</dt><dd>${E(s.answers?.comment || '-')}</dd>
@@ -2865,6 +3205,7 @@ async function handleSubmit(f){
   if(await handlePortalForm(f, fd)) return;
   if(await handleAftercareForm(f, fd)) return;
   if(await handleMailForm(f, fd)) return;
+  if(await handleSurveyForm(f, fd)) return;
   if(f.id === 'loginForm'){
     st.loginEmail = String(fd.get('email') || '');
     st.busy = true; st.loginErr = ''; render();
